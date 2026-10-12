@@ -767,6 +767,30 @@ async function screenReview() {
     h("div", { class: "review" }, h("div", { class: "card" }, memoBody(s5, true, openSource, state.reviewFilter)), sourcePanel));
 }
 
+// --------------------------------------------------------------------------- app lifetime
+// The backend stops itself when no tab has the app open, so closing the tab closes everything.
+let backendGone = false;
+function showStopped() {
+  if (backendGone) return;
+  backendGone = true;
+  const n = document.getElementById("notice");
+  n.textContent = "The app has stopped. Double-click start.bat to open it again.";
+  n.style.background = "#fde7e7"; n.style.color = "#9c1c1c";
+}
+const beat = () => fetch("/api/heartbeat", { method: "POST" }).then((r) => { if (!r.ok) throw new Error(); }).catch(showStopped);
+beat();
+setInterval(beat, 10000);
+window.addEventListener("pagehide", () => navigator.sendBeacon("/api/closing"));
+document.getElementById("close-app").addEventListener("click", async () => {
+  if (!window.confirm("Close the app? The backend stops and any AI step still running is cancelled. Saved work is kept.")) return;
+  try { await fetch("/api/shutdown", { method: "POST" }); } catch (e) { }
+  backendGone = true;
+  document.body.replaceChildren(h("main", { style: "padding:40px;font:16px 'Segoe UI',sans-serif" },
+    h("h1", {}, "The app has been closed."),
+    h("p", {}, "You can close this browser tab. To open the app again, double-click start.bat.")));
+  window.close();
+});
+
 // --------------------------------------------------------------------------- start
 $name.value = localStorage.getItem("analystName") || "";
 $name.addEventListener("input", () => localStorage.setItem("analystName", $name.value));

@@ -186,19 +186,28 @@ class KiroCliClient:
         env["NO_COLOR"] = "1"
         if self._key:
             env["KIRO_API_KEY"] = self._key
+        from . import lifecycle
+
         with tempfile.TemporaryDirectory(prefix="kiro_task_") as workdir:
             try:
-                proc = subprocess.run(args, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                      timeout=timeout_s, cwd=workdir, env=env)
-            except subprocess.TimeoutExpired as exc:
-                raise LLMTransportError(f"The Kiro CLI did not respond within {int(timeout_s)} seconds.") from exc
+                proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                        encoding="utf-8", errors="replace", cwd=workdir, env=env)
             except OSError as exc:
                 raise LLMTransportError(f"The Kiro CLI could not be started: {exc}") from exc
+            lifecycle.register(proc)  # stopped too if the app is closed mid-call
+            try:
+                stdout, stderr = proc.communicate(prompt, timeout=timeout_s)
+            except subprocess.TimeoutExpired as exc:
+                lifecycle.kill_tree(proc)
+                proc.communicate()
+                raise LLMTransportError(f"The Kiro CLI did not respond within {int(timeout_s)} seconds.") from exc
+            finally:
+                lifecycle.unregister(proc)
         if proc.returncode != 0:
-            detail = ANSI_RE.sub("", (proc.stderr or proc.stdout or "").strip())[-600:]
+            detail = ANSI_RE.sub("", (stderr or stdout or "").strip())[-600:]
             hint = " Run `kiro-cli login` or set LLM_API_KEY to a Kiro API key." if "auth" in detail.lower() or "login" in detail.lower() else ""
             raise LLMTransportError(redact(f"Kiro CLI exited with code {proc.returncode}: {detail}{hint}", [self._key]))
-        return extract_json_object(proc.stdout)
+        return extract_json_object(stdout)
 
 
 def make_client(settings: Settings) -> LLMClient:

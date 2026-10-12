@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import documents as docs
-from . import export, review, sections
+from . import export, lifecycle, review, sections
 from .financial import LoadError, build_dashboard, load_csv
 from .settings import get_settings
 from .storage import AppError, Repo, deal_lock, now_iso
@@ -43,6 +43,24 @@ def prompts(request: Request):
 @router.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@router.post("/heartbeat")
+def heartbeat():
+    lifecycle.heartbeat()
+    return {"ok": True}
+
+
+@router.post("/closing")
+def closing():
+    lifecycle.closing()
+    return {"ok": True}
+
+
+@router.post("/shutdown")
+def shutdown():
+    lifecycle.request_shutdown()
+    return {"ok": True, "message": "The app is closing."}
 
 
 @router.get("/status")

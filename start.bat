@@ -57,12 +57,19 @@ if errorlevel 1 (
 )
 
 rem ---- 5. Start the backend (serves the frontend too) and open the browser -----
+rem APP_AUTO_SHUTDOWN=1: the backend stops itself when the browser tab is closed or "Close app" is clicked.
+set "APP_AUTO_SHUTDOWN=1"
 start "" /b ".venv\Scripts\python.exe" tools\launcher.py open
 ".venv\Scripts\python.exe" -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port %PORT%
-echo.
-echo  The app has stopped.
-pause
-exit /b 0
+if errorlevel 1 (
+  echo.
+  echo  The app stopped with an error. See the messages above.
+  echo.
+  pause
+  exit /b 1
+)
+rem Normal close: this window closes too, so nothing keeps running.
+exit 0
 
 :nopython
 echo.

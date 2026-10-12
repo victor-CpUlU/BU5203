@@ -52,6 +52,9 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=500, content={"error_code": "internal_error",
                                                       "message": redact(f"Unexpected error: {exc}", get_settings().secrets())})
 
+    from . import lifecycle
+    lifecycle.start_watchdog()  # only when started by start.bat (APP_AUTO_SHUTDOWN=1)
+
     app.include_router(router)
     app.mount("/", StaticFiles(directory=str(PROJECT_ROOT / "frontend"), html=True), name="frontend")
     return app

@@ -77,8 +77,15 @@ If you can't use the Kiro CLI, the app also works with an API key from another p
 1. Double-click **`start.bat`**.
 2. **First run only:** it installs the app's Python packages, which takes a few minutes. It then creates `.env`, opens it in Notepad and stops. Check the settings (the default `LLM_PROVIDER=kiro_cli` is fine if the Kiro CLI is set up), save the file, and double-click `start.bat` again.
 3. The app opens in your browser at **http://127.0.0.1:8000**.
-4. The black window that opens is the app itself. **Keep it open while you work and close it to stop the app.**
-5. **To restart, just double-click `start.bat` again**, even if you closed only the browser tab. If an earlier copy is still running, it is stopped and a fresh copy starts and opens. Your saved deals are kept.
+4. The black window that opens runs the backend. Leave it open while you work (you can minimise it).
+5. **Closing the app shuts everything down.** Any of these stops the backend, any AI step still running, and the black window. Your saved deals are kept.
+   - Click **Close app** at the top right (stops immediately), or
+   - close the browser tab (stops about 20 seconds later; refreshing the page does not count as closing), or
+   - close the black window.
+   If the browser crashes without closing the tab properly, the backend stops on its own after 2 minutes.
+6. **To open it again, double-click `start.bat`.** If an earlier copy is somehow still running, it is stopped and a fresh copy starts.
+
+Keep the app in **one** browser tab. If you close one of two open tabs, the backend may stop while the other is still open.
 
 The badge at the top right shows which AI provider is in use. A red **"AI not configured"** badge means a `.env` setting is missing.
 
@@ -238,8 +245,11 @@ Probably not. Long filings are sent to the AI 30 pages at a time, first for 2A a
 **My PDF is bigger than the upload limit.**
 The limit is `max_upload_mb` in `config\analysis.toml` (default 200 MB), and it applies without a restart. Large annual reports are usually big because of images. Saving the file again with "Reduce file size" or Print → Save as PDF makes it much smaller without losing the text.
 
-**I closed the browser and double-clicking `start.bat` doesn't seem to do anything.**
-Double-click it again: it now restarts the app automatically if an earlier copy is still running, and opens the browser. You can also open http://127.0.0.1:8000 directly while the black window is open.
+**I closed the browser. Is the app still running in the background?**
+No. Closing the tab (or clicking **Close app**) stops the backend and closes the black window. Double-click `start.bat` to open it again.
+
+**The page says "The app has stopped."**
+The backend was closed (from another tab, the Close app button, or the black window). Double-click `start.bat` to open it again.
 
 ---
 
