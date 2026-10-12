@@ -1,0 +1,32 @@
+# Analysis settings. Thresholds are tolerances for labelling and review flags, not credit benchmarks.
+
+max_upload_mb = 200      # largest PDF accepted per upload (annual reports with images can exceed 50 MB)
+max_csv_mb = 5
+page_limit = 30          # pages per extraction request (1-200)
+llm_timeout_s = 120
+llm_max_retries = 2
+
+[large_swing]            # change between adjacent periods that raises a "large swing" flag
+percent = 10.0           # percentage points
+multiple = 2.0           # x
+days = 5.0               # days
+amount = 50.0            # % of the absolute earlier value
+
+[stable_band]            # change within the band is labelled "~"
+percent = 1.0
+multiple = 0.10
+days = 3.0
+amount = 5.0
+
+[keywords]
+business = [
+  "item 1. business", "business overview", "our business", "business model", "segment", "segments",
+  "products", "customers", "suppliers", "manufacturing", "foundry", "capital expenditure",
+  "investment", "geographic", "competition", "executive officers", "board of directors",
+  "ownership", "revenue by", "net revenue", "strategy",
+]
+debt = [
+  "debt", "borrowings", "notes due", "senior notes", "credit facility", "revolving",
+  "commercial paper", "maturities", "interest expense", "covenant", "secured", "unsecured",
+  "refinanc", "financing arrangements", "term loan", "liquidity and capital resources",
+]
