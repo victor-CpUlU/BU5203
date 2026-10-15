@@ -18,10 +18,19 @@ from .sections import load_context
 from .storage import AppError, Repo
 
 MEMO_HEADER = "AI-generated draft reviewed by the analyst. Not a credit decision."
+NAVY = colors.HexColor("#0f2d4e")
+GOLD = colors.HexColor("#c79214")
+GREY = colors.HexColor("#5a6676")
+LINE = colors.HexColor("#d2d8e1")
 STYLES = getSampleStyleSheet()
-BODY = ParagraphStyle("body", parent=STYLES["BodyText"], fontSize=9.5, leading=13, spaceAfter=4)
+BODY = ParagraphStyle("body", parent=STYLES["BodyText"], fontSize=10, leading=14, spaceAfter=5)
 SMALL = ParagraphStyle("small", parent=BODY, fontSize=8.5, leading=11, textColor=colors.HexColor("#333333"))
-H1, H2, H3 = STYLES["Title"], STYLES["Heading2"], STYLES["Heading3"]
+STMT = ParagraphStyle("stmt", parent=BODY, fontSize=10, leading=14, spaceAfter=6, spaceBefore=0)
+CAPTION = ParagraphStyle("caption", parent=BODY, fontSize=8, leading=11, textColor=GREY, spaceAfter=2)
+REF = ParagraphStyle("ref", parent=BODY, fontSize=8.5, leading=12, textColor=colors.HexColor("#333333"), spaceAfter=3, leftIndent=10, firstLineIndent=-10)
+H1 = ParagraphStyle("h1", parent=STYLES["Title"], textColor=NAVY, fontSize=22, spaceAfter=2)
+H2 = ParagraphStyle("h2", parent=STYLES["Heading2"], textColor=NAVY, fontSize=13.5, spaceBefore=14, spaceAfter=6, borderWidth=0, borderPadding=0)
+H3 = ParagraphStyle("h3", parent=STYLES["Heading3"], textColor=colors.HexColor("#2d6294"), fontSize=10.5, spaceBefore=8, spaceAfter=3)
 
 
 def sanitise_borrower(name: str) -> str:
@@ -33,16 +42,50 @@ def file_name(borrower: str, kind: str, on: date | None = None) -> str:
     return f"{sanitise_borrower(borrower)}_CreditMemo_{d}.pdf" if kind == "memo" else f"{sanitise_borrower(borrower)}_CreditMemo_AuditTrail_{d}.pdf"
 
 
-def citation(ref: str, ctx: dict) -> str:
-    if ref in ctx["evidence"]:
-        e = ctx["evidence"][ref]
-        return f"[{e['doc_name']}, p.{e['page']}]"
-    if ref in ctx["csv"]:
-        e = ctx["csv"][ref]
-        return f"[Financial database: {e['metric_label_as_written']}, {e['column_header']}]"
-    if ref in ctx["intake"]:
-        return f"[Deal intake: {ctx['intake'][ref]['label']}]"
-    return f"[Unknown reference {ref}]"
+class CiteLedger:
+    """Assigns a stable [n] marker to each distinct Evidence_ID the first time it is cited, so the memo
+    body stays readable and all source detail is consolidated in one 'Sources and references' list."""
+
+    def __init__(self, ctx: dict):
+        self.ctx = ctx
+        self.order: list[str] = []
+        self.num: dict[str, int] = {}
+
+    def mark(self, refs: list[str]) -> str:
+        """Return a compact superscript-style marker group like ' [1][2]' for a statement's refs."""
+        nums = []
+        for r in refs:
+            if r not in self.num:
+                self.order.append(r)
+                self.num[r] = len(self.order)
+            nums.append(self.num[r])
+        return "".join(f'<super><font size="7" color="#0f2d4e">[{n}]</font></super>' for n in nums)
+
+    def entries(self) -> list[tuple[int, str, str]]:
+        """(number, kind, full description) for every cited source, in first-citation order."""
+        out = []
+        for r in self.order:
+            n = self.num[r]
+            if r in self.ctx["evidence"]:
+                e = self.ctx["evidence"][r]
+                desc = f"{e['doc_name']}, page {e['page']}"
+                if e.get("section_heading"):
+                    desc += f" ({e['section_heading']})"
+                if e.get("excerpt"):
+                    desc += f': \u201c{e["excerpt"]}\u201d'
+                out.append((n, "Document", f"{r} \u2014 {desc}"))
+            elif r in self.ctx["csv"]:
+                e = self.ctx["csv"][r]
+                desc = f"Financial database ({e['file_name']}): {e['metric_label_as_written']}, {e['column_header']} = {e['display']}"
+                if e.get("flags"):
+                    desc += f" [flags: {', '.join(e['flags'])}]"
+                out.append((n, "Financial database", f"{r} \u2014 {desc}"))
+            elif r in self.ctx["intake"]:
+                e = self.ctx["intake"][r]
+                out.append((n, "Deal intake", f"{r} \u2014 Deal intake: {e['label']} = {e['display']}"))
+            else:
+                out.append((n, "Unresolved", f"{r} \u2014 reference does not exist"))
+        return out
 
 
 def _build(path: Path, story: list, header: str) -> None:
@@ -82,36 +125,91 @@ def memo_pdf(repo: Repo, deal_id: str, analyst: str) -> Path:
     if not name:
         raise AppError(422, "analyst_name", "The analyst name is required to generate the final memo.")
     ctx = load_context(repo, deal)
+    ledger = CiteLedger(ctx)
     borrower = deal["intake"]["DI-BORROWER"]["display"]
-    story = [Paragraph(f"Credit Memo: {escape(borrower)}", H1),
-             Paragraph(escape(f"Facility: {deal['intake']['DI-FACILITY_TYPE']['display']} | Amount: {deal['intake']['DI-AMOUNT']['display']}"), BODY),
-             Paragraph(escape(f"Analyst: {name} | Review date: {_review_date(repo.audit(deal_id))}"), BODY),
-             Spacer(1, 6)]
+    i = deal["intake"]
+    counts = {k: sum(1 for s in s5["statements"] if s["status"] == k) for k in ("Approved", "Flagged")}
+
+    # ---- cover block -------------------------------------------------------
+    story = [Paragraph(f"Credit Memorandum", H1),
+             Paragraph(escape(borrower), ParagraphStyle("sub", parent=BODY, fontSize=13, textColor=GOLD, spaceAfter=10)),
+             _summary_box([
+                 ("Borrower", i["DI-BORROWER"]["display"]),
+                 ("Facility type", i["DI-FACILITY_TYPE"]["display"]),
+                 ("Amount requested", i["DI-AMOUNT"]["display"]),
+                 ("Tenor", i["DI-TENOR"]["display"]),
+                 ("Repayment", i["DI-REPAYMENT"]["display"]),
+                 ("Purpose", i["DI-PURPOSE"]["display"]),
+                 ("Reviewing analyst", name),
+                 ("Review date", _review_date(repo.audit(deal_id))),
+             ]),
+             Spacer(1, 4),
+             Paragraph(escape(f"Statements: {counts['Approved']} approved" + (f", {counts['Flagged']} flagged" if counts["Flagged"] else "")
+                              + ". Figures are drawn from the financial database and cited documents; the AI performs no calculations."), CAPTION),
+             Spacer(1, 8)]
+
+    # ---- memo body ---------------------------------------------------------
     for number, title, subs in MEMO_OUTLINE:
-        story.append(Paragraph(f"{number}. {escape(title)}", H2))
+        story.append(Paragraph(f"{number}.\u2003{escape(title)}", H2))
+        story.append(_rule())
+        wrote_any = False
         for key, sub_title in subs:
             sts = [s for s in s5["statements"] if s["section"] == number and s["subsection"] == key]
             if not sts:
                 continue
+            wrote_any = True
             story.append(Paragraph(escape(sub_title), H3))
             for s in sts:
                 parts = []
                 if s["status"] == "Flagged":
-                    parts.append('<font color="#b00020"><b>FLAGGED</b></font>')
-                if s["label"] in ("ASSUMPTION", "NOT VERIFIED"):
-                    parts.append(f"<b>[{s['label']}]</b>")
+                    parts.append('<font color="#b00020"><b>\u26a0 FLAGGED</b></font> ')
+                if s["label"] == "ASSUMPTION":
+                    parts.append('<font color="#8a5a00"><b>[Assumption]</b></font> ')
+                elif s["label"] == "NOT VERIFIED":
+                    parts.append('<font color="#9c1c1c"><b>[Not verified]</b></font> ')
                 parts.append(escape(s["text"]))
-                cites = " ".join(escape(citation(r, ctx)) for r in s["refs"])
-                if cites:
-                    parts.append(f'<font size="8" color="#1f4e79">{cites}</font>')
-                parts.append(f"({s['id']})")
+                parts.append(ledger.mark(s["refs"]))
                 if s["status"] == "Flagged" and s.get("note"):
-                    parts.append(f'<font size="8" color="#b00020">Flag note: {escape(s["note"])}</font>')
-                story.append(Paragraph(" ".join(parts), BODY))
+                    parts.append(f'<br/><font size="8" color="#b00020">Flag note: {escape(s["note"])}</font>')
+                story.append(Paragraph("".join(parts), STMT))
+        if not wrote_any:
+            story.append(Paragraph("No content in this section.", CAPTION))
+
+    # ---- consolidated sources ---------------------------------------------
+    entries = ledger.entries()
+    story.append(Paragraph("Sources and references", H2))
+    story.append(_rule())
+    if entries:
+        story.append(Paragraph("Each [n] marker in the memo refers to the numbered source below.", CAPTION))
+        for n, _kind, desc in entries:
+            story.append(Paragraph(f'<b>[{n}]</b> {escape(desc)}', REF))
+    else:
+        story.append(Paragraph("No sources were cited in this memo.", CAPTION))
+
     path = repo.path(deal_id, "exports", file_name(borrower, "memo"))
     path.parent.mkdir(parents=True, exist_ok=True)
     _build(path, story, MEMO_HEADER)
     return path
+
+
+def _summary_box(rows: list[tuple[str, str]]) -> Table:
+    data = [[Paragraph(f"<b>{escape(k)}</b>", SMALL), Paragraph(escape(str(v)), SMALL)] for k, v in rows]
+    t = Table(data, colWidths=[42 * mm, 132 * mm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eef3f8")),
+        ("BOX", (0, 0), (-1, -1), 0.5, LINE),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, LINE),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LINEBEFORE", (0, 0), (0, -1), 2, GOLD),
+        ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    return t
+
+
+def _rule() -> Table:
+    t = Table([[""]], colWidths=[174 * mm], rowHeights=[1])
+    t.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), 1, GOLD), ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
+    return t
 
 
 def _table(rows: list[list[str]], widths: list[float]) -> Table:

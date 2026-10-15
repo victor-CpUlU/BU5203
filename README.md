@@ -4,6 +4,8 @@ This app helps a credit analyst decide whether a borrower can support a specific
 
 > The app runs only on your own computer and has **no login**. Do not put it on a shared network without adding access control.
 
+> **Developers:** this file is the user guide. For the design spec, pipeline rules, data conventions and the AI prompts, see [`Instructions.md`](Instructions.md). See [section 8](#8-for-developers) for the developer workflow.
+
 ---
 
 ## 1. First-time setup
@@ -95,7 +97,7 @@ The badge at the top right shows which AI provider is in use. A red **"AI not co
 
 - **Enter your name** in the **Analyst name** box at the top of the page. It is recorded with every approval, flag and correction in the audit trail. Your browser remembers it.
 - **Get the borrower's documents as PDFs**, for example the 10-K, 10-Q, annual report or audited financial statements. SEC EDGAR filings are web pages, so download the PDF from the company's investor relations site, or open the filing in your browser and use **Print → Save as PDF**. Scanned PDFs without selectable text can be uploaded but cannot be read.
-- **Prepare the financial database (CSV).** By default the app uses `intel_quarterly_ratios.csv`. See [section 5](#5-financial-database-csv-format) for the format.
+- **The financial database is connected automatically.** You don't load or upload it. The app fetches the borrower's figures from the external financial database (by default `intel_quarterly_ratios.csv`) as soon as you create the deal, and shows them in Section 2. See [section 5](#5-financial-database-csv-format) for the format the database uses.
 
 ---
 
@@ -108,9 +110,8 @@ The left-hand menu follows Sections 1 to 6. Under each step it shows that step's
 1. On the home page, click **Start a new deal**.
 2. Fill in the loan request: borrower, facility type, requested amount and currency, purpose, tenor and repayment structure. Collateral is optional; if you leave it blank, the app records "None provided". Click **Create deal**.
 3. **Upload documents.** In the Documents card, choose a PDF and set its document type, the period it covers (e.g. `FY2025`) and whether it is audited. You can also give it a display name such as `Intel 2025 10-K`. Then click **Upload document**. Repeat for each file. Each file gets an ID (D1, D2, ...).
-4. **Load the financial database.** Click **Load financial database**. The CSV has no borrower column, so the app asks you to confirm that the whole file belongs to this borrower. Click OK to continue.
-   - To use a different CSV for this deal, choose it under **Replacement CSV**, click **Upload replacement CSV**, then click **Load**.
-   - After loading, the app lists **values flagged for review** (zero values, negative values, large swings, amounts with no stated unit) and the **information gaps**. The values themselves are never changed.
+
+When you create the deal, the app automatically connects to the external financial database and fetches this borrower's figures. There is no button to press. The data, the **values flagged for review** (zero values, negative values, large swings, amounts with no stated unit) and the **information gaps** are shown in [Section 2](#section-2-extraction). The values themselves are never changed. If the database cannot be reached, Section 2 shows the error.
 
 ### Section 2: Extraction
 
@@ -127,6 +128,8 @@ Each item gets an **Evidence ID** (`EV-001`, ...). The app then checks that the 
 - Items the app rejected, for example because they were too long or cited a page that wasn't supplied, are listed under **rejected items**.
 
 You can re-run 2A or 2B on its own. Long filings take a few minutes because pages are sent in batches.
+
+**2C Financial data (external database).** Below 2A and 2B, Section 2 shows the figures fetched automatically from the external financial database when the deal was created, with a note that they come from the database. The AI never extracts or calculates these numbers; Python loads them exactly as stored (with Pandas). This card lists the periods and metrics found, the **values flagged for review** and the **information gaps**. Each value has a `CSV-` Evidence ID used throughout the memo.
 
 ### Section 3: Financial dashboard and AI analysis
 
@@ -198,7 +201,7 @@ Regenerating the memo replaces it and resets all Section 6 reviews.
 
 ### Re-running earlier steps
 
-If you re-run an earlier step (for example re-extract documents or reload the CSV), the later steps are marked **"Out of date"**. Re-run them so the memo matches the latest data.
+If you re-run an earlier step (for example re-extract documents), the later steps are marked **"Out of date"**. Re-run them so the memo matches the latest data. The financial database is connected once when the deal is created; to pick up changed figures, start a new deal.
 
 ---
 
@@ -224,14 +227,18 @@ Operating Cash Flow,7006,1096,4288,2546
 - **Period headers:** must look like `Q2 2026 (Jun 27 2026)`. They can be in any order; the app sorts them oldest to newest.
 - **Recognised metrics:** Revenue Growth, EBITDA Margin, Debt/EBITDA, Interest Coverage, Current Ratio, Debt-Service Coverage Ratio (DSCR), Operating Cash Flow, Operating Cash Flow Margin, Working Capital, Days Sales Outstanding (DSO). Any other rows are kept and marked "Unrecognised metric".
 - **Values:** `25.40%`, `4.11x`, or a plain number. Empty or text cells show as "Not available in database".
-- **Several borrowers in one file (optional):** add a `Borrower` column. The app then uses only the rows matching the deal's borrower name, and doesn't ask for confirmation.
+- **Several borrowers in one file (optional):** add a `Borrower` column. The app then uses only the rows matching the deal's borrower name. Without a `Borrower` column, the whole file is treated as this borrower's data and the app records the information gap "Database has no borrower identifier".
+- **Which file is used:** the app always connects to the default database set by `financial_db_path` (by default `intel_quarterly_ratios.csv` in the project folder). The connection happens automatically when a deal is created.
 
 ---
 
 ## 6. Frequently asked questions
 
 **Do I need to put 10-K or 10-Q files in the project folder first?**
-No. The analyst uploads the borrower's documents inside the app (Section 1 → Documents), like an AI credit memo tool. Nothing needs to be in the project folder except the default CSV.
+No. The analyst uploads the borrower's documents inside the app (Section 1 → Documents), like an AI credit memo tool. Nothing needs to be in the project folder except the financial database file the app connects to.
+
+**Where do the financial figures come from? I never loaded them.**
+The app simulates a connection to an external financial database and fetches the figures automatically when you create the deal, so there is no load or upload step. They appear in Section 2 (2C) with a note that they come from the database, and in the Section 3 dashboard. The default database is `intel_quarterly_ratios.csv` (set by `financial_db_path`).
 
 **Why does the app need the Kiro CLI? Can't it use the Kiro chat?**
 The Kiro chat in the editor has no way for another program to send it prompts. The Kiro CLI does, and it uses your Kiro account, so it is the way to run the app on Kiro. Any of the other providers in [section 1](#other-ai-providers-alternatives) work too.
@@ -263,6 +270,7 @@ The backend was closed (from another tab, the Close app button, or the black win
 | Red "AI not configured" badge | Fill in the missing setting it names in `.env`, then restart the app. |
 | "Kiro CLI not found" | Install the Kiro CLI (see setup) and open a **new** PowerShell to check `kiro-cli --version`. Then restart the app with `start.bat`. If it is still not found, run `(Get-Command kiro-cli).Source` in PowerShell and put that path in `.env` as `KIRO_CLI_PATH=...`. |
 | Kiro CLI login or "API key required" error | Run `kiro-cli login` in PowerShell (check with `kiro-cli whoami`), or put a Kiro API key in `LLM_API_KEY` in `.env`. |
+| Section 2 shows "Could not connect to the financial database" | The database file is missing or malformed. Check that `financial_db_path` points to a valid CSV (default `intel_quarterly_ratios.csv`, see [section 5](#5-financial-database-csv-format) for the format), then create the deal again. |
 | A section "failed" | Expand **Last run failed** to see why. Earlier results are kept, so you can simply run it again. |
 | "No relevant pages were found" | The PDF may be scanned (no text), or may not cover that topic. Upload a text-based PDF. |
 | Section 4 or 5 button is greyed out | Approve Section 3 first (for Section 4), or complete Section 4 (for Section 5). |

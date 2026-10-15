@@ -152,13 +152,13 @@ def memo_action(repo: Repo, deal_id: str, sid: str, action: str, analyst: str | 
                 raise AppError(422, "text_length", "The flag note must be at most 500 characters.")
             entry.update({"status_after": "Flagged", "text_after": st["text"], "correction": "", "note": note})
             repo.append_audit(deal_id, entry)
-            st.update({"status": "Flagged", "note": note or "Flagged by analyst"})
+            st.update({"status": "Flagged", "note": note or "Flagged by analyst", "carried_over": False})
         elif action == "correct":
             new_text = valid_text(text, 2000, "corrected statement")
             verification = verify_statement({**st, "text": new_text}, ctx, "S5")
             entry.update({"status_after": "Pending", "text_after": new_text, "correction": new_text})
             repo.append_audit(deal_id, entry)
-            st.update({"text": new_text, "status": "Pending", "note": "Corrected by analyst; review again", "verification": verification})
+            st.update({"text": new_text, "status": "Pending", "note": "Corrected by analyst; review again", "verification": verification, "carried_over": False})
         else:
             raise AppError(422, "bad_action", "Unknown action.")
         repo.write(deal_id, "s5.json", s5)

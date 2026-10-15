@@ -15,7 +15,8 @@ const STEPS = [
   ["review", "6. Review & export"],
 ];
 const UNIT_LABEL = { percent: "Percent (%)", multiple: "Multiple (x)", days: "Days", amount: "Amount (unit not stated in database)" };
-const PALETTE = ["#1f4e79", "#b35c00", "#2e7d32", "#7b1fa2", "#00838f"];
+// Navy + gold led palette; later colours stay in the same cool/warm family so multi-line charts read as one set.
+const PALETTE = ["#0f2d4e", "#c79214", "#4a7aa7", "#9c6b1f", "#6b8f9c"];
 
 // --------------------------------------------------------------------------- helpers
 function h(tag, attrs = {}, ...kids) {
@@ -109,6 +110,11 @@ function evButton(id, statementId, onOpen) {
   return h("button", { class: "ev", type: "button", title: `Open source for ${id}`, onclick: () => onOpen(id, statementId) }, id);
 }
 
+function nextSection(dealId, screen, label = "Next Section") {
+  return h("nav", { class: "next-nav", "aria-label": "Section navigation" },
+    h("a", { class: "button-link next-btn", href: `#/deal/${dealId}/${screen}` }, label, h("span", { class: "next-arrow", "aria-hidden": "true" }, "\u2192")));
+}
+
 async function download(path, body, button) {
   await busy(button, "Generating PDF...", async () => {
     const res = await fetch(`/api${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
@@ -135,8 +141,11 @@ function sectionState(deal, key) {
   if (!deal) return "";
   const s = deal.sections;
   switch (key) {
-    case "intake": return deal.financial.status === "loaded" ? `${deal.documents.length} document(s), CSV loaded` : `${deal.documents.length} document(s), CSV not loaded`;
-    case "extraction": return `2A ${s.s2a.status.replace("_", " ")}, 2B ${s.s2b.status.replace("_", " ")}`;
+    case "intake": return `${deal.documents.length} document(s)`;
+    case "extraction": {
+      const fin = deal.financial.status === "connected" || deal.financial.status === "loaded" ? "database connected" : deal.financial.status === "error" ? "database error" : "database not connected";
+      return `2A ${s.s2a.status.replace("_", " ")}, 2B ${s.s2b.status.replace("_", " ")}, ${fin}`;
+    }
     case "dashboard": return s.s3.status === "not_run" ? "AI analysis not run" : `${s.s3.status}${deal.s3_approved ? ", approved" : ", not approved"}`;
     case "risks": return s.s4.status.replace("_", " ");
     case "memo": return s.s5.status.replace("_", " ");
@@ -176,6 +185,8 @@ async function route() {
         memo: screenMemo, review: screenReview }[screen] || screenIntake)();
     } else if (parts[0] === "new") {
       state.deal = null; renderNav("new"); screenNewDeal();
+    } else if (parts[0] === "edit" && parts[1]) {
+      state.deal = null; renderNav("new"); await screenEditDeal(parts[1]);
     } else {
       state.deal = null; renderNav("home"); await screenHome();
     }
@@ -199,13 +210,27 @@ async function rerender() {
 // --------------------------------------------------------------------------- home + new deal
 async function screenHome() {
   const deals = await api("GET", "/deals");
+  const deleteDeal = async (d, btn) => {
+    if (!window.confirm(`Delete the deal for "${d.borrower}"?\n\nThis permanently removes its documents, extracted evidence, analysis, memo and audit trail. This cannot be undone.`)) return;
+    try {
+      await busy(btn, "Deleting...", () => api("DELETE", `/deals/${d.deal_id}`));
+      toast(`Deal for "${d.borrower}" deleted.`, true);
+      await screenHome();
+    } catch (e) { /* toast shown */ }
+  };
+  const rows = deals.map((d) => h("tr", {},
+    h("td", {}, h("a", { href: `#/deal/${d.deal_id}/intake` }, d.borrower)),
+    h("td", {}, d.facility_type),
+    h("td", {}, d.created_at.replace("T", " ").slice(0, 16)),
+    h("td", { class: "actions-cell" },
+      h("a", { href: `#/edit/${d.deal_id}`, class: "button-link small-link" }, "Edit"),
+      h("button", { type: "button", class: "small danger", onclick: (ev) => deleteDeal(d, ev.currentTarget) }, "Delete"))));
   $main.replaceChildren(
     h("h2", {}, "Credit analyses"),
     h("div", { class: "row" }, h("a", { href: "#/new", class: "button-link" }, "Start a new deal")),
     h("div", { class: "card", style: "margin-top:12px" },
-      deals.length ? h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Borrower"), h("th", {}, "Facility"), h("th", {}, "Created"))),
-        h("tbody", {}, deals.map((d) => h("tr", {}, h("td", {}, h("a", { href: `#/deal/${d.deal_id}/intake` }, d.borrower)),
-          h("td", {}, d.facility_type), h("td", {}, d.created_at.replace("T", " ").slice(0, 16))))))
+      deals.length ? h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Borrower"), h("th", {}, "Facility"), h("th", {}, "Created"), h("th", {}, "Actions"))),
+        h("tbody", {}, rows))
         : h("p", { class: "empty" }, "No deals yet. Start a new deal to enter a loan request.")));
 }
 
@@ -227,38 +252,66 @@ function showFieldErrors(form, fields) {
   if (first) first.focus();
 }
 
-function screenNewDeal() {
-  const inp = (id, attrs = {}) => h("input", { id: `f-${id}`, name: id, type: "text", ...attrs });
-  const ta = (id, attrs = {}) => h("textarea", { id: `f-${id}`, name: id, ...attrs });
+function dealForm(values, submitLabel, onSubmit) {
+  const v = values || {};
+  const inp = (id, attrs = {}) => h("input", { id: `f-${id}`, name: id, type: "text", value: v[id] ?? "", ...attrs });
+  const ta = (id, attrs = {}) => h("textarea", { id: `f-${id}`, name: id, ...attrs }, v[id] ?? "");
   const form = h("form", { class: "card", novalidate: true },
     h("div", { class: "grid2" },
-      field("f-borrower", "Borrower / company name *", inp("borrower", { required: true, maxlength: 200, value: "Intel Corporation" })),
+      field("f-borrower", "Borrower / company name *", inp("borrower", { required: true, maxlength: 200 })),
       field("f-facility_type", "Facility type *", inp("facility_type", { required: true, maxlength: 100, list: "facility-types", placeholder: "e.g. Term loan" })),
       field("f-amount", "Requested amount *", inp("amount", { required: true, inputmode: "decimal", placeholder: "e.g. 500000000" }), "Numbers only, up to 2 decimals"),
-      field("f-currency", "Currency *", inp("currency", { required: true, maxlength: 3, value: "USD" }), "3-letter code"),
+      field("f-currency", "Currency *", inp("currency", { required: true, maxlength: 3 }), "3-letter code"),
       field("f-tenor", "Tenor *", inp("tenor", { required: true, maxlength: 100, placeholder: "e.g. 5 years" }))),
-    h("datalist", { id: "facility-types" }, ["Term loan", "Revolving credit facility", "Bridge loan", "Syndicated loan", "Trade finance line"].map((v) => h("option", { value: v }))),
+    h("datalist", { id: "facility-types" }, ["Term loan", "Revolving credit facility", "Bridge loan", "Syndicated loan", "Trade finance line"].map((x) => h("option", { value: x }))),
     h("div", { class: "grid2", style: "margin-top:12px" },
       field("f-purpose", "Purpose of loan *", ta("purpose", { required: true, maxlength: 2000 })),
       field("f-repayment", "Repayment structure *", ta("repayment", { required: true, maxlength: 2000, placeholder: "e.g. Bullet at maturity / quarterly amortisation" })),
       field("f-collateral", "Collateral / security (optional)", ta("collateral", { maxlength: 2000 }), "Left blank = \"None provided\"")),
-    h("div", { class: "row", style: "margin-top:14px" }, h("button", { type: "submit" }, "Create deal")));
+    h("div", { class: "row", style: "margin-top:14px" }, h("button", { type: "submit" }, submitLabel),
+      h("a", { href: "#/", class: "button-link secondary-link" }, "Cancel")));
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const data = Object.fromEntries(new FormData(form).entries());
     const missing = ["borrower", "facility_type", "amount", "currency", "purpose", "tenor", "repayment"]
       .filter((k) => !String(data[k] || "").trim()).map((k) => ({ field: k, reason: "This field is required" }));
     if (missing.length) { showFieldErrors(form, missing); return; }
-    try {
-      const deal = await api("POST", "/deals", data);
-      location.hash = `#/deal/${deal.deal_id}/intake`;
-    } catch (e) {
-      showFieldErrors(form, e.body?.fields);
-      toast(errText(e));
-    }
+    try { await onSubmit(data); }
+    catch (e) { showFieldErrors(form, e.body?.fields); toast(errText(e)); }
+  });
+  return form;
+}
+
+function screenNewDeal() {
+  const form = dealForm({ borrower: "Intel Corporation", currency: "USD" }, "Create deal", async (data) => {
+    const deal = await api("POST", "/deals", data);
+    location.hash = `#/deal/${deal.deal_id}/intake`;
   });
   $main.replaceChildren(h("h2", {}, "Section 1: Deal intake"),
     h("p", {}, "Enter the loan request. The analysis assesses whether the borrower can support this specific request."), form);
+}
+
+async function screenEditDeal(dealId) {
+  const deal = await api("GET", `/deals/${dealId}`);
+  const i = deal.intake;
+  const values = {
+    borrower: i["DI-BORROWER"].display,
+    facility_type: i["DI-FACILITY_TYPE"].display,
+    amount: i["DI-AMOUNT"].amount,
+    currency: i["DI-AMOUNT"].currency,
+    tenor: i["DI-TENOR"].display,
+    purpose: i["DI-PURPOSE"].display,
+    repayment: i["DI-REPAYMENT"].display,
+    collateral: i["DI-COLLATERAL"].display === "None provided" ? "" : i["DI-COLLATERAL"].display,
+  };
+  const form = dealForm(values, "Save changes", async (data) => {
+    await api("PUT", `/deals/${dealId}`, data);
+    toast("Deal updated.", true);
+    location.hash = `#/deal/${dealId}/intake`;
+  });
+  $main.replaceChildren(h("h2", {}, "Edit deal"),
+    h("p", {}, "Update the loan request. Changing the borrower re-connects the financial database; any analysis already run will be marked out of date so you can re-run it."),
+    form);
 }
 
 // --------------------------------------------------------------------------- Section 1: deal + documents + CSV
@@ -300,51 +353,39 @@ async function screenIntake() {
         h("td", {}, d.extraction_excluded ? tag("No extractable text: excluded", "bad") : d.no_text_pages.length ? tag(`${d.no_text_pages.length} page(s) without text`, "warn") : "")))))
     : h("p", { class: "empty" }, "No documents uploaded yet. Upload the 10-K, 10-Q, annual report or audited statements.");
 
-  // financial database
-  const fin = h("div", {});
-  const csvInput = h("input", { id: "f-csv", type: "file", accept: ".csv,text/csv" });
-  const loadBtn = h("button", { type: "button" }, deal.financial.status === "loaded" ? "Reload financial database" : "Load financial database");
-  const upCsvBtn = h("button", { type: "button", class: "secondary" }, "Upload replacement CSV");
-  upCsvBtn.addEventListener("click", async () => {
-    if (!csvInput.files.length) { toast("Choose a .csv file first."); csvInput.focus(); return; }
-    const fd = new FormData(); fd.append("file", csvInput.files[0]);
-    await busy(upCsvBtn, "Uploading CSV...", () => api("POST", `/deals/${deal.deal_id}/financial/upload`, fd, true)).catch(() => null);
-    toast("CSV uploaded for this deal. Now load it.", true);
-    await rerender();
-  });
-  loadBtn.addEventListener("click", async () => {
-    try {
-      let res = await busy(loadBtn, "Loading financial database...", () => api("POST", `/deals/${deal.deal_id}/financial/load`, { confirm: null }));
-      if (res.status === "needs_confirmation") {
-        const ok = window.confirm(res.message + "\n\nOK = the whole file belongs to this borrower. Cancel = stop loading.");
-        res = await busy(loadBtn, "Loading financial database...", () => api("POST", `/deals/${deal.deal_id}/financial/load`, { confirm: ok }));
-      }
-      toast("Financial database loaded.", true);
-      await rerender();
-    } catch (e) { /* toast shown */ }
-  });
-  fin.append(
-    h("p", {}, "Financial figures and credit metrics come only from the financial database (CSV), loaded with Python and Pandas. Nothing is calculated by the AI."),
-    h("p", {}, "Source: ", h("b", {}, deal.financial.source ? `${deal.financial.source} (uploaded for this deal)` : `${state.status.default_csv} (default)`),
-      deal.financial.status === "loaded" ? h("span", {}, " ", tag("Loaded", "ok")) : h("span", {}, " ", tag("Not loaded", "warn"))),
-    h("div", { class: "row" }, loadBtn, h("label", { for: "f-csv" }, "Replacement CSV (optional):"), csvInput, upCsvBtn));
-  if (deal.financial.status === "loaded") {
-    const ds = await api("GET", `/deals/${deal.deal_id}/financial`);
-    fin.append(
-      h("p", {}, `Periods (oldest to newest): ${ds.periods.map((p) => p.label).join(", ")}. Metrics: ${ds.metrics.length}.`),
-      h("h4", {}, `Values flagged for review (${ds.flagged_values.length})`),
-      ds.flagged_values.length ? h("table", {}, h("thead", {}, h("tr", {}, ["Evidence ID", "Metric", "Period", "Value", "Flags"].map((x) => h("th", {}, x)))),
-        h("tbody", {}, ds.flagged_values.map((f) => h("tr", {}, h("td", {}, h("code", {}, f.evidence_id)), h("td", {}, f.metric), h("td", {}, f.period),
-          h("td", {}, f.display), h("td", {}, f.flags.map((x) => tag(x, "warn"))))))) : h("p", {}, "None."),
-      h("h4", {}, "Information gaps"), h("ul", {}, ds.information_gaps.map((g) => h("li", {}, g))));
-  }
-
   $main.replaceChildren(
     h("h2", {}, "Section 1: Deal intake and data"),
     h("div", { class: "card" }, h("h3", {}, "Loan request"), intakeTable),
     h("div", { class: "card" }, h("h3", {}, "Documents"), upForm, h("div", { style: "margin-top:12px" }, docTable)),
-    h("div", { class: "card" }, h("h3", {}, "Financial database (Section 2D)"), fin),
-    h("p", {}, h("a", { href: `#/deal/${deal.deal_id}/extraction` }, "Next: Section 2 extraction")));
+    h("p", {}, "Financial data is fetched automatically from the external financial database and shown in ",
+      h("a", { href: `#/deal/${deal.deal_id}/extraction` }, "Section 2"), "."),
+    nextSection(deal.deal_id, "extraction"));
+}
+
+// --------------------------------------------------------------------------- Section 2C: financial database display (auto-connected)
+async function financialCard(deal) {
+  const fin = deal.financial || {};
+  if (fin.status === "error") {
+    return h("div", { class: "card" }, h("h3", {}, "2C Financial data (external database)"),
+      h("p", { class: "tag bad" }, `Could not connect to the financial database${fin.file_name ? ` (${fin.file_name})` : ""}: ${fin.error || "unknown error"}`),
+      h("p", { class: "small muted" }, "The connection is attempted automatically when the deal is created. Check the database file, then create the deal again."));
+  }
+  if (fin.status !== "connected" && fin.status !== "loaded") {
+    return h("div", { class: "card" }, h("h3", {}, "2C Financial data (external database)"),
+      h("p", { class: "empty" }, "The financial database is not connected for this deal."));
+  }
+  const ds = await api("GET", `/deals/${deal.deal_id}/financial`);
+  return h("div", { class: "card" },
+    h("h3", {}, "2C Financial data (external database)"),
+    h("p", { class: "disclaimer" }, "These figures are fetched automatically from the external financial database (",
+      h("b", {}, fin.file_name || ds.file_name), "), connected via the system. Values are loaded with Python and Pandas exactly as stored; nothing is calculated or extracted by the AI."),
+    h("p", {}, `Periods (oldest to newest): ${ds.periods.map((p) => p.label).join(", ")}. Metrics: ${ds.metrics.length}.`),
+    h("h4", {}, `Values flagged for review (${ds.flagged_values.length})`),
+    ds.flagged_values.length ? h("table", {}, h("thead", {}, h("tr", {}, ["Evidence ID", "Metric", "Period", "Value", "Flags"].map((x) => h("th", {}, x)))),
+      h("tbody", {}, ds.flagged_values.map((f) => h("tr", {}, h("td", {}, h("code", {}, f.evidence_id)), h("td", {}, f.metric), h("td", {}, f.period),
+        h("td", {}, f.display), h("td", {}, f.flags.map((x) => tag(x, "warn"))))))) : h("p", {}, "None."),
+    h("h4", {}, "Information gaps"),
+    ds.information_gaps.length ? h("ul", {}, ds.information_gaps.map((g) => h("li", {}, g))) : h("p", {}, "None."));
 }
 
 // --------------------------------------------------------------------------- source viewer
@@ -429,15 +470,17 @@ async function screenExtraction() {
     return h("div", { class: "card" }, head, s2.message ? h("p", { class: "tag warn" }, s2.message) : null,
       h("table", {}, h("thead", {}, h("tr", {}, ["Field", "Evidence ID", "Statement", "Document", "Page", "Passage", "Issues"].map((x) => h("th", {}, x)))), h("tbody", {}, rows)));
   };
+  const finCard = await financialCard(deal);
   $main.replaceChildren(
     h("h2", {}, "Section 2: Extract and organise the relevant information"),
     h("div", { class: "card" },
-      h("p", {}, "The AI reads the uploaded documents and extracts business information (2A) and debt and financing information (2B). Each item gets an Evidence ID and its supporting passage is checked on the cited page with PyMuPDF. Financial figures are not extracted by the AI; they come from the financial database."),
+      h("p", {}, "The AI reads the uploaded documents and extracts business information (2A) and debt and financing information (2B). Each item gets an Evidence ID and its supporting passage is checked on the cited page with PyMuPDF. Financial figures (2C) are not extracted by the AI; they are fetched automatically from the external financial database."),
       deal.documents.length ? h("div", { class: "row" }, run(["business", "debt"], "Run extraction (2A and 2B)"), run(["business"], "Re-run 2A only"), run(["debt"], "Re-run 2B only"))
         : h("p", { class: "tag warn" }, "Upload at least one PDF in Section 1 first.")),
     group("business", "2A Business information", "s2a"),
     group("debt", "2B Debt and financing information", "s2b"),
-    h("p", {}, h("a", { href: `#/deal/${deal.deal_id}/dashboard` }, "Next: Section 3 financial dashboard")));
+    finCard,
+    nextSection(deal.deal_id, "dashboard"));
 }
 
 // --------------------------------------------------------------------------- Section 3
@@ -451,7 +494,7 @@ const pointLabels = {
       meta.data.forEach((pt, j) => {
         if (ds.data[j] === null || ds.data[j] === undefined) return;
         const text = ds.displays[j] + (ds.flags[j].length ? " \u26a0" : "");
-        ctx.save(); ctx.font = "600 11px 'Segoe UI', sans-serif"; ctx.fillStyle = "#1b1f24"; ctx.textAlign = "center";
+        ctx.save(); ctx.font = "600 11px 'Segoe UI', sans-serif"; ctx.fillStyle = "#0f2d4e"; ctx.textAlign = "center";
         ctx.fillText(text, pt.x, pt.y - 9); ctx.restore();
       });
     });
@@ -465,18 +508,26 @@ function panelCharts(panel, periods) {
   let colour = 0;
   for (const [unit, metrics] of Object.entries(byUnit)) {
     const canvas = h("canvas", { role: "img", "aria-label": `${panel.title} chart: ${metrics.map((m) => m.label).join(", ")}. Values are listed in the data table below.` });
-    wrap.append(h("p", { class: "small muted", style: "margin:4px 0" }, UNIT_LABEL[unit] || unit), h("div", { class: "chart-box" }, canvas));
+    wrap.append(h("p", { class: "chart-unit" }, UNIT_LABEL[unit] || unit), h("div", { class: "chart-box" }, canvas));
     const datasets = metrics.map((m) => {
       const c = PALETTE[colour++ % PALETTE.length];
       return { label: m.label, data: m.series.map((p) => p.value), displays: m.series.map((p) => p.display), flags: m.series.map((p) => p.flags),
-        borderColor: c, backgroundColor: c, spanGaps: false, tension: 0, pointRadius: 4,
+        borderColor: c, backgroundColor: c, pointBackgroundColor: c, pointBorderColor: "#ffffff", pointBorderWidth: 1.5,
+        borderWidth: 2.5, spanGaps: false, tension: .25, pointRadius: 4.5, pointHoverRadius: 6,
         pointStyle: m.series.map((p) => (p.flags.length ? "triangle" : "circle")), pointRadiusFlags: 6 };
     });
+    const AXIS = "#5a6676", GRID = "rgba(15,45,78,.08)", NAVY = "#0f2d4e";
     state.charts.push(new Chart(canvas, {
       type: "line", data: { labels: periods, datasets },
       options: { responsive: true, maintainAspectRatio: false, animation: false, layout: { padding: { top: 18 } },
-        plugins: { legend: { position: "bottom" }, tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.dataset.displays[ctx.dataIndex]}${ctx.dataset.flags[ctx.dataIndex].length ? " (flags: " + ctx.dataset.flags[ctx.dataIndex].join(", ") + ")" : ""}` } } },
-        scales: { y: { title: { display: true, text: UNIT_LABEL[unit] || unit }, grace: "10%" } } },
+        plugins: {
+          legend: { position: "bottom", labels: { color: NAVY, usePointStyle: true, pointStyle: "circle", padding: 14, font: { size: 12 } } },
+          tooltip: { backgroundColor: NAVY, titleColor: "#fff", bodyColor: "#fff", borderColor: "#c79214", borderWidth: 1, padding: 10, cornerRadius: 6, displayColors: true,
+            callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.dataset.displays[ctx.dataIndex]}${ctx.dataset.flags[ctx.dataIndex].length ? " (flags: " + ctx.dataset.flags[ctx.dataIndex].join(", ") + ")" : ""}` } } },
+        scales: {
+          x: { grid: { color: GRID, drawTicks: false }, border: { color: GRID }, ticks: { color: AXIS, font: { size: 11 } } },
+          y: { title: { display: true, text: UNIT_LABEL[unit] || unit, color: AXIS, font: { size: 11 } }, grace: "10%",
+               grid: { color: GRID, drawTicks: false }, border: { display: false }, ticks: { color: AXIS, font: { size: 11 } } } } },
       plugins: [pointLabels],
     }));
   }
@@ -485,7 +536,7 @@ function panelCharts(panel, periods) {
 
 function dataTable(panel, periods) {
   if (!panel.metrics.length) return null;
-  return h("details", {}, h("summary", {}, `Data table: ${panel.title}`),
+  return h("details", { class: "data-table" }, h("summary", {}, `Data table: ${panel.title}`),
     h("table", {}, h("caption", { class: "small muted" }, "Values exactly as stored in the financial database, oldest to newest"),
       h("thead", {}, h("tr", {}, h("th", {}, "Period"), panel.metrics.map((m) => h("th", {}, m.label)))),
       h("tbody", {}, periods.map((p, i) => h("tr", {}, h("th", { scope: "row" }, p), panel.metrics.map((m) => {
@@ -531,8 +582,11 @@ function s3Statement(st, approved) {
 
 async function screenDashboard() {
   const deal = state.deal;
-  if (deal.financial.status !== "loaded") {
-    $main.replaceChildren(h("h2", {}, "Section 3: Financial trend dashboard"), h("p", { class: "empty" }, "The financial database CSV must be loaded first (Section 1)."));
+  if (deal.financial.status !== "connected" && deal.financial.status !== "loaded") {
+    $main.replaceChildren(h("h2", {}, "Section 3: Financial trend dashboard"),
+      h("p", { class: "empty" }, deal.financial.status === "error"
+        ? `The financial database could not be connected: ${deal.financial.error || "unknown error"}. See Section 2.`
+        : "The financial database is not connected for this deal. See Section 2."));
     return;
   }
   const [dash, s3] = await Promise.all([api("GET", `/deals/${deal.deal_id}/dashboard`), api("GET", `/deals/${deal.deal_id}/section3`)]);
@@ -583,18 +637,30 @@ async function screenDashboard() {
     has && !deal.s3_approved ? h("p", { class: "small muted" }, "To approve, every statement must be Approved or Flagged, and any statement with a number mismatch must be corrected or flagged. Read the commentary beside each chart first; use the bulk buttons for the remaining routine statements.") : null,
     bulkRow);
 
-  const panels = dash.panels.map((p) => {
-    const latest = h("div", { class: "latest" }, p.metrics.map((m) => h("div", { class: "metric" }, `${m.label} (${m.latest.period}): `, h("b", {}, m.latest.display),
-      m.latest.flags.length ? h("div", {}, m.latest.flags.map((f) => tag(f, "warn"))) : null,
-      h("div", { class: "small" }, m.latest_comparison ? `${m.latest_comparison.from_period} to ${m.latest_comparison.to_period}: ${m.latest_comparison.change_display} (${m.latest_comparison.direction === "~" ? "stable" : m.latest_comparison.direction})` : "No comparison available",
-        m.sustained ? ` - ${m.sustained}` : ""))));
-    const commentary = has ? stmts.filter((s) => s.group === `panel:${p.key}`).map((s) => s3Statement(s)) : [h("p", { class: "empty" }, "The Section 3 analysis has not been run.")];
-    return h("section", { class: "card", "aria-labelledby": `panel-${p.key}` },
-      h("h3", { id: `panel-${p.key}` }, p.title),
+  const panels = !has ? [] : dash.panels.map((p) => {
+    const latest = p.metrics.length ? h("div", { class: "latest" }, p.metrics.map((m) => {
+      const c = m.latest_comparison;
+      // Colour the delta by whether the move is favourable, not just its direction.
+      // For lower-is-better metrics (Debt/EBITDA, DSO) a rise is unfavourable.
+      const lowerBetter = m.key === "DEBT_EBITDA" || m.key === "DSO";
+      let tone = "flat";
+      if (c && c.direction === "up") tone = lowerBetter ? "down" : "up";
+      else if (c && c.direction === "down") tone = lowerBetter ? "up" : "down";
+      return h("div", { class: "metric" },
+        h("div", { class: "metric-label" }, m.label),
+        h("div", { class: "metric-value" }, h("b", {}, m.latest.display), h("span", { class: "metric-period" }, m.latest.period)),
+        m.latest.flags.length ? h("div", { class: "metric-flags" }, m.latest.flags.map((f) => tag(f, "warn"))) : null,
+        c ? h("div", { class: `metric-delta ${tone}` }, c.direction === "~" ? "\u2192 stable" : (c.direction === "up" ? "\u2191 " : "\u2193 ") + c.change_display)
+          : h("div", { class: "metric-delta flat" }, "no comparison"),
+        m.sustained ? h("div", { class: "metric-sustained" }, m.sustained) : null);
+    })) : null;
+    const commentary = stmts.filter((s) => s.group === `panel:${p.key}`).map((s) => s3Statement(s));
+    return h("section", { class: "card panel-card", "aria-labelledby": `panel-${p.key}` },
+      h("div", { class: "panel-head" }, h("h3", { id: `panel-${p.key}` }, p.title)),
       h("div", { class: "panel" },
-        h("div", {}, panelCharts(p, dash.periods), latest,
-          p.not_available.length ? h("p", { class: "small" }, h("b", {}, "Not available in database: "), p.not_available.join(", ")) : null, dataTable(p, dash.periods)),
-        h("div", {}, h("h4", { style: "margin-top:0" }, "AI commentary"), commentary)));
+        h("div", { class: "panel-data" }, panelCharts(p, dash.periods), latest,
+          p.not_available.length ? h("p", { class: "not-avail" }, h("b", {}, "Not available in database: "), p.not_available.join(", ")) : null, dataTable(p, dash.periods)),
+        h("div", { class: "panel-commentary" }, h("h4", { class: "commentary-head" }, "AI commentary"), commentary)));
   });
 
   const extra = [];
@@ -606,13 +672,16 @@ async function screenDashboard() {
     extra.push(h("div", { class: "card" }, h("h3", {}, "Relationships between database metrics"), cross.length ? cross.map((s) => s3Statement(s)) : h("p", { class: "muted" }, "None reported.")));
     const dims = ["profitability", "cash_generation", "leverage", "liquidity", "debt_servicing"];
     extra.push(h("div", { class: "card" }, h("h3", {}, "Repayment capacity"),
-      dims.map((d) => h("div", {}, h("h4", {}, d.replace("_", " ").replace(/^./, (c) => c.toUpperCase())),
-        h("div", { class: "grid2" },
-          h("div", {}, h("p", { class: "small" }, h("b", {}, "Supports repayment")), stmts.filter((s) => s.group === `repayment:${d}:supports`).map((s) => s3Statement(s))),
-          h("div", {}, h("p", { class: "small" }, h("b", {}, "Weakens repayment")), stmts.filter((s) => s.group === `repayment:${d}:weakens`).map((s) => s3Statement(s))))))));
+      dims.map((d) => h("div", { class: "repay-dim" },
+        h("h4", {}, d.replace("_", " ").replace(/^./, (c) => c.toUpperCase())),
+        h("div", { class: "repay-cols" },
+          h("div", { class: "repay-col supports" }, h("p", { class: "repay-head" }, "\u2713 Supports repayment"), stmts.filter((s) => s.group === `repayment:${d}:supports`).map((s) => s3Statement(s))),
+          h("div", { class: "repay-col weakens" }, h("p", { class: "repay-head" }, "\u26a0 Weakens repayment"), stmts.filter((s) => s.group === `repayment:${d}:weakens`).map((s) => s3Statement(s))))))));
   }
-  $main.replaceChildren(h("h2", {}, "Section 3: Financial trend dashboard and AI analysis"), top, panels, extra,
-    h("p", {}, h("a", { href: `#/deal/${deal.deal_id}/risks` }, "Next: Section 4 risks and mitigants")));
+  const emptyState = has ? null : h("div", { class: "empty" },
+    "No financial analysis yet. Click \u201cRun AI financial analysis\u201d above to generate the trend charts, dashboard and AI commentary for this deal.");
+  $main.replaceChildren(h("h2", {}, "Section 3: Financial trend dashboard and AI analysis"), top, emptyState, ...panels, ...extra,
+    nextSection(deal.deal_id, "risks"));
 }
 
 // --------------------------------------------------------------------------- Section 4
@@ -646,7 +715,7 @@ async function screenRisks() {
     if (s4.limitations.length) body.push(h("h4", {}, "Limitations"), h("ul", {}, s4.limitations.map((l) => h("li", {}, l))));
   } else body.push(h("p", { class: "empty" }, "Not run yet."));
   $main.replaceChildren(h("h2", {}, "Section 4: Identify key risks and suggest mitigants"), head, h("div", { class: "card" }, body),
-    h("p", {}, h("a", { href: `#/deal/${deal.deal_id}/memo` }, "Next: Section 5 credit memo")));
+    nextSection(deal.deal_id, "memo"));
 }
 
 // --------------------------------------------------------------------------- Sections 5 and 6
@@ -659,12 +728,20 @@ function memoStatement(st, review, openSource) {
       st.refs.length ? st.refs.map((r) => evButton(r, st.id, openSource)) : h("span", { class: "muted" }, "No references")));
   if (st.note) box.append(h("div", { class: "small", style: "margin-top:4px" }, "Note: ", st.note));
   if (st.verification.unmatched.length) box.append(h("div", { class: "unmatched" }, "Not matched: " + st.verification.unmatched.map((u) => `${u.value} (${u.reason})`).join("; ")));
-  if (st.text !== st.original_text) box.append(h("div", { class: "small muted" }, "Corrected. AI original: ", st.original_text));
+  if (st.text !== st.original_text) box.append(h("div", { class: "small muted" }, "Edited. AI original: ", st.original_text));
   if (review && state.status.support_check_enabled) {
     box.append(h("div", { class: "small", style: "margin-top:4px" }, st.support ? [tag(st.support.assessment, st.support.assessment === "Supported" ? "ok" : st.support.assessment === "Not supported" ? "bad" : "warn"),
       " ", st.support.reason, " ", h("span", { class: "muted" }, "(AI preliminary check; analyst verification required)")] : h("span", { class: "muted" }, "AI support check: Not checked")));
   }
   if (!review) return box;
+  // Already approved in an earlier section (Section 3 financial review or backend-generated from the
+  // database): no need to make the analyst approve the same point again. Show a note instead of buttons.
+  if (st.carried_over && st.status === "Approved") {
+    box.append(h("div", { class: "carried-over" },
+      tag("\u2713 Approved in Section 3", "ok"),
+      h("span", { class: "small muted" }, "Carried over from the financial review \u2014 no action needed here. Click an Evidence ID to inspect the source.")));
+    return box;
+  }
   const act = async (action, text, btn) => {
     if (needName()) return;
     try {
@@ -676,8 +753,8 @@ function memoStatement(st, review, openSource) {
     } catch (e) { }
   };
   const editor = (kind) => {
-    const ta = h("textarea", { "aria-label": kind === "correct" ? `Correct ${st.id}` : `Flag note for ${st.id}`, maxlength: kind === "correct" ? 2000 : 500 }, kind === "correct" ? st.text : "");
-    const save = h("button", { type: "button", class: "small" }, kind === "correct" ? "Save correction" : "Flag with note");
+    const ta = h("textarea", { "aria-label": kind === "correct" ? `Edit ${st.id}` : `Flag note for ${st.id}`, maxlength: kind === "correct" ? 2000 : 500 }, kind === "correct" ? st.text : "");
+    const save = h("button", { type: "button", class: "small" }, kind === "correct" ? "Save edit" : "Flag with note");
     save.addEventListener("click", () => act(kind === "correct" ? "correct" : "flag", ta.value, save));
     const ed = h("div", { class: "editor" }, ta, h("div", { class: "row" }, save, h("button", { type: "button", class: "small secondary", onclick: () => ed.remove() }, "Cancel")));
     box.querySelector(".editor")?.remove(); box.append(ed); ta.focus();
@@ -685,7 +762,7 @@ function memoStatement(st, review, openSource) {
   const ap = h("button", { type: "button", class: "small" }, "Approve"); ap.addEventListener("click", () => act("approve", null, ap));
   box.append(h("div", { class: "actions" }, ap,
     h("button", { type: "button", class: "small secondary", onclick: () => editor("flag") }, "Flag"),
-    h("button", { type: "button", class: "small secondary", onclick: () => editor("correct") }, "Correct")));
+    h("button", { type: "button", class: "small secondary", onclick: () => editor("correct") }, "Edit")));
   return box;
 }
 
@@ -722,7 +799,8 @@ async function screenMemo() {
         s5.statements ? h("a", { href: `#/deal/${deal.deal_id}/review` }, "Go to Section 6 review") : null),
       st.status === "stale" ? h("p", { class: "tag warn" }, "Out of date: an earlier section changed. Regenerate the memo.") : null,
       st.last_error ? h("details", {}, h("summary", {}, "Last run failed"), h("ul", {}, st.last_error.map((x) => h("li", {}, x)))) : null),
-    s5.statements ? h("div", { class: "card" }, memoBody(s5, false, (id) => sourceDialog(id))) : h("p", { class: "empty" }, "No memo yet."));
+    s5.statements ? h("div", { class: "card" }, memoBody(s5, false, (id) => sourceDialog(id))) : h("p", { class: "empty" }, "No memo yet."),
+    s5.statements ? nextSection(deal.deal_id, "review") : null);
 }
 
 async function screenReview() {

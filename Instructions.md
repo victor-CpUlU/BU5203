@@ -5,6 +5,8 @@ This file is the single source of truth for the project. It has two audiences:
 - **Coding agent / developer:** Parts 1-4 describe the pipeline, the rules and how the code is organised.
 - **Runtime LLM (inside the app):** receives the Master System Prompt (Part 5) as the system message on every call, plus the prompt for the current section (Part 6). The backend loads these prompts from `backend/app/prompts/`, which must match this file word for word. After editing a prompt here, run `.venv\Scripts\python tools\sync_prompts.py` (a test checks they match).
 
+For setup, day-to-day use, and troubleshooting of the running app, see the user guide in [`README.md`](README.md). This file is the design spec and prompt source.
+
 Test borrower for now: **Intel Corporation** (Sector: Technology, Industry: Semiconductors). Nothing is hard-coded to Intel.
 
 ---
@@ -13,8 +15,8 @@ Test borrower for now: **Intel Corporation** (Sector: Technology, Industry: Semi
 
 | Section | Name | Done by | Output |
 |---|---|---|---|
-| 1 | Deal Intake + Document Upload | Analyst | Deal record (`DI-` fields) + uploaded PDFs (D1, D2, ...) |
-| 2 | Extract and Organise the Relevant Information | 2A business and 2B debt/financing: LLM. 2C evidence IDs and passage check: backend (PyMuPDF). 2D financial data: backend (CSV + Pandas) | Evidence store (`EV-###`), financial dataset (`CSV-...`) |
+| 1 | Deal Intake + Document Upload | Analyst enters the deal and uploads PDFs; backend auto-connects to the external financial database | Deal record (`DI-` fields) + uploaded PDFs (D1, D2, ...) + connected financial dataset (`CSV-...`) |
+| 2 | Extract and Organise the Relevant Information | 2A business and 2B debt/financing: LLM, with backend evidence IDs and PyMuPDF passage check. 2C financial data: backend (CSV + Pandas), fetched automatically at deal creation and displayed here | Evidence store (`EV-###`), financial dataset (`CSV-...`) shown in the app |
 | 3 | Financial Trend Dashboard + AI Analysis | Charts and comparisons: backend. Commentary: LLM. Number check: backend. Approval: Analyst | Approved financial analysis |
 | 4 | Identify Key Risks + Suggest Mitigants | LLM, number check by backend | 3-5 ranked risks with evidence, mitigants and proposed terms (suggestions only) |
 | 5 | Generate the Credit Memo with Evidence | LLM, reference and number checks by backend | 7-section memo citing existing Evidence IDs |
@@ -25,7 +27,7 @@ Audit trail chain: **Source document / CSV -> Extracted information -> AI analys
 ## Part 2. Principles
 
 1. **Closed source boundary.** Only uploaded documents, deal intake data, the financial database (CSV) and earlier section outputs are used. No external databases, websites, market data or general knowledge presented as fact.
-2. **Financial figures come only from the CSV.** Historical figures and credit metrics are loaded from the financial database by the backend with Pandas. Neither the backend nor the LLM calculates credit ratios, and the LLM never extracts financial figures from documents. The backend only computes quarter-on-quarter changes and directions (Comparison_Records) so the LLM can quote them instead of calculating.
+2. **Financial figures come only from the CSV.** The backend connects to the external financial database automatically when a deal is created (simulating a system/API connection; no analyst load step) and loads the borrower's figures and credit metrics with Pandas. Neither the backend nor the LLM calculates credit ratios, and the LLM never extracts financial figures from documents. The backend only computes quarter-on-quarter changes and directions (Comparison_Records) so the LLM can quote them instead of calculating.
 3. **Everything is traceable.** Every important statement cites existing Evidence IDs. The backend checks that every cited ID exists and that every number matches the cited data.
 4. **Missing data is flagged, never filled.** Metrics that are not in the CSV are shown as "Not available in database" and become Information Gaps.
 5. **The analyst decides.** The AI suggests risks, mitigants and terms for consideration only. There is no AI approval, decline or recommendation.
@@ -37,6 +39,7 @@ Audit trail chain: **Source document / CSV -> Extracted information -> AI analys
 - The LLM provider is set in `.env` and is only called through the provider-agnostic LLM_Client: `kiro_cli` (Kiro subscription via `kiro-cli chat --no-interactive`, authenticated by `kiro-cli login` or a Kiro API key), `openai`, `gemini` or `anthropic` (provider API key). The Kiro CLI runs in an empty temporary folder with no tool permissions and receives the prompt on stdin.
 - Start-up: double-click `start.bat`. It creates `.venv`, installs pinned dependencies, creates `.env` from `.env.example` on first run, starts the app on `127.0.0.1:8000` and opens the browser.
 - **The prototype runs locally for a single user with no authentication. Authentication must be added before any shared or networked deployment.**
+- Financial database connection: the backend reads the default database at `financial_db_path` once, automatically, when the deal is created, and writes the dataset and `CSV-` evidence for that deal. There is no analyst load or upload action. A file with no `Borrower` column is taken to belong to the deal's borrower (recorded as the information gap "Database has no borrower identifier"); a `Borrower` column filters to the matching rows. If the file is missing or malformed the deal is still created with `financial.status = "error"` and the message is surfaced in Section 2, so a bad database file never blocks deal creation.
 - AI retry rule: invalid JSON, schema or unknown-reference failures are retried up to 2 times with the errors fed back. Network/provider errors and timeouts are retried in Section 2 only; Sections 3-6 stop and show the error. In Section 5, statements that still cite an unknown ID after the retries are kept and Flagged ("Reference does not exist").
 
 ## Part 4. Data conventions

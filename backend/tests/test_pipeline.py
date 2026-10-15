@@ -19,6 +19,12 @@ def test_full_pipeline(env, fake_llm):
     deal = c.post("/api/deals", json=INTAKE).json()
     did = deal["deal_id"]
     assert deal["intake"]["DI-COLLATERAL"]["display"] == "None provided" and deal["intake"]["DI-AMOUNT"]["display"] == "500000000 USD"
+    # Section 2D: the external financial database is auto-connected at deal creation (no analyst action)
+    assert deal["financial"]["status"] == "connected" and deal["financial"]["confirmed"] is True
+    fin = c.get(f"/api/deals/{did}/financial").json()
+    assert "Database has no borrower identifier" in fin["information_gaps"]
+    assert len(fin["comparisons"]) == 30
+    assert len(c.get(f"/api/deals/{did}/dashboard").json()["panels"]) == 5
 
     # documents
     pdf = make_pdf(env / "intel.pdf", [
@@ -32,13 +38,8 @@ def test_full_pipeline(env, fake_llm):
                 data={"doc_type": "10-K", "period_covered": "FY2025", "audited": "Yes", "display_name": "Intel 2025 10-K"})
     assert up.status_code == 200 and up.json()["document"]["doc_id"] == "D1" and up.json()["document"]["page_count"] == 2
 
-    # Section 3 cannot run before data and extraction
+    # Section 3 cannot run before extraction (the database is already connected)
     assert c.post(f"/api/deals/{did}/section3/run").status_code == 409
-    # Section 2D: CSV with confirmation
-    assert c.post(f"/api/deals/{did}/financial/load", json={}).json()["status"] == "needs_confirmation"
-    loaded = c.post(f"/api/deals/{did}/financial/load", json={"confirm": True}).json()
-    assert loaded["status"] == "ok" and len(loaded["dataset"]["comparisons"]) == 30
-    assert len(c.get(f"/api/deals/{did}/dashboard").json()["panels"]) == 5
 
     # Section 2: extraction with evidence IDs located on the page
     assert c.post(f"/api/deals/{did}/section2/run", json={}).status_code == 200
@@ -121,3 +122,38 @@ def test_full_pipeline(env, fake_llm):
     assert {"llm_output", "number_check", "s3_approval", "s3_approval_revoked", "memo_review"} <= {a["type"] for a in trail}
     for f in (env / "data").rglob("*.json"):
         assert "SECRETKEY" not in f.read_text(encoding="utf-8")
+
+
+def test_edit_and_delete_deal(env, fake_llm):
+    c = TestClient(create_app())
+    deal = c.post("/api/deals", json=INTAKE).json()
+    did = deal["deal_id"]
+    assert deal["financial"]["status"] == "connected"
+
+    # edit the loan request (same borrower): fields update, financial stays connected
+    edited = c.put(f"/api/deals/{did}", json={**INTAKE, "amount": "750000000", "tenor": "7 years"})
+    assert edited.status_code == 200
+    body = edited.json()
+    assert body["intake"]["DI-AMOUNT"]["display"] == "750000000 USD" and body["intake"]["DI-TENOR"]["display"] == "7 years"
+    assert body["financial"]["status"] == "connected"
+
+    # changing the borrower re-connects the external database for the new name
+    rebranded = c.put(f"/api/deals/{did}", json={**INTAKE, "borrower": "Acme Semiconductors"}).json()
+    assert rebranded["intake"]["DI-BORROWER"]["display"] == "Acme Semiconductors"
+    assert rebranded["financial"]["status"] == "connected"
+
+    # validation still applies on edit
+    bad = c.put(f"/api/deals/{did}", json={**INTAKE, "amount": "abc"})
+    assert bad.status_code == 422 and any(f["field"] == "amount" for f in bad.json()["fields"])
+
+    # audit records the edits
+    trail = c.get(f"/api/deals/{did}/audit-trail").json()
+    assert any(a["type"] == "deal_edited" for a in trail)
+
+    # delete removes the deal from the list and from disk
+    assert c.delete(f"/api/deals/{did}").json() == {"deleted": True, "deal_id": did}
+    assert all(d["deal_id"] != did for d in c.get("/api/deals").json())
+    assert c.get(f"/api/deals/{did}").status_code == 404
+    assert not (env / "data" / "deals" / did).exists()
+    # deleting a non-existent deal is a 404
+    assert c.delete(f"/api/deals/{did}").status_code == 404

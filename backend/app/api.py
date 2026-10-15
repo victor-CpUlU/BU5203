@@ -121,12 +121,47 @@ def validate_intake(req: IntakeRequest) -> dict:
     return intake
 
 
+def auto_connect_financial(r: Repo, deal_id: str) -> None:
+    """Simulate an automatic connection to the external financial database (default CSV).
+
+    Runs at deal creation. No analyst action and no confirmation prompt: a file with no
+    Borrower column is treated as belonging to this deal's borrower (confirm=True), which the
+    loader records as the information gap "Database has no borrower identifier". A missing or
+    malformed database file does not block deal creation; the deal keeps financial.status="error"
+    and the message is surfaced in Section 2.
+    """
+    s = get_settings()
+    deal = r.get_deal(deal_id)
+    try:
+        res = load_csv(s.financial_db_path, deal["intake"]["DI-BORROWER"]["display"], True, s.large_swing, s.stable_band)
+    except LoadError as exc:
+        with deal_lock(deal_id):
+            deal = r.get_deal(deal_id)
+            deal["financial"].update({"status": "error", "source": None, "file_name": s.financial_db_path.name,
+                                      "error": str(exc), "loaded_at": now_iso()})
+            r.save_deal(deal)
+            r.append_audit(deal_id, {"type": "financial_connect_failed", "analyst_name": "System",
+                                     "file_name": s.financial_db_path.name, "error": str(exc)})
+        return
+    ds = res["dataset"]
+    with deal_lock(deal_id):
+        r.append_audit(deal_id, {"type": "financial_connected", "analyst_name": "System", "file_name": ds["file_name"],
+                                 "values": len(res["evidence"])})
+        r.write(deal_id, "financial/dataset.json", ds)
+        r.write(deal_id, "financial/csv_evidence.json", res["evidence"])
+        deal = r.get_deal(deal_id)
+        deal["financial"].update({"status": "connected", "confirmed": True, "source": None,
+                                  "file_name": ds["file_name"], "error": None, "loaded_at": now_iso()})
+        r.save_deal(deal)
+
+
 @router.post("/deals")
 def create_deal(req: IntakeRequest):
     r = repo()
     deal = r.create_deal(validate_intake(req))
     r.append_audit(deal["deal_id"], {"type": "deal_created", "analyst_name": "System", "intake": {k: v["display"] for k, v in deal["intake"].items()}})
-    return deal
+    auto_connect_financial(r, deal["deal_id"])
+    return r.get_deal(deal["deal_id"])
 
 
 @router.get("/deals")
@@ -141,6 +176,42 @@ def get_deal(deal_id: str):
     s5 = r.read(deal_id, "s5.json")
     deal["memo_counts"] = {k: sum(1 for s in s5["statements"] if s["status"] == k) for k in ("Approved", "Flagged", "Pending")} if s5 else None
     return deal
+
+
+@router.put("/deals/{deal_id}")
+def update_deal(deal_id: str, req: IntakeRequest):
+    """Edit the loan request (deal intake). If the borrower changes, the external financial database is
+    re-connected for the new borrower; any completed later sections are marked out of date so the analyst
+    re-runs them against the edited request."""
+    r = repo()
+    new_intake = validate_intake(req)
+    with deal_lock(deal_id):
+        deal = r.get_deal(deal_id)
+        old_intake = deal["intake"]
+        changed = [ref for ref in new_intake if old_intake.get(ref, {}).get("display") != new_intake[ref]["display"]]
+        borrower_changed = old_intake.get("DI-BORROWER", {}).get("display") != new_intake["DI-BORROWER"]["display"]
+        deal["intake"] = new_intake
+        r.append_audit(deal_id, {"type": "deal_edited", "analyst_name": "System",
+                                 "changed_fields": changed,
+                                 "intake": {k: v["display"] for k, v in new_intake.items()}})
+        # Editing the request can invalidate downstream analysis that quoted the old DI- values.
+        if changed:
+            Repo.mark_later_stale(deal, "s2a")  # from Section 3 onward
+        r.save_deal(deal)
+    if borrower_changed:
+        # Re-fetch the financial database for the new borrower (overwrites the connected dataset).
+        auto_connect_financial(r, deal_id)
+    return r.get_deal(deal_id)
+
+
+@router.delete("/deals/{deal_id}")
+def delete_deal(deal_id: str):
+    """Delete the deal and all of its stored data (documents, evidence, section outputs, audit trail, exports)."""
+    r = repo()
+    r.get_deal(deal_id)  # 404 if it does not exist
+    with deal_lock(deal_id):
+        r.delete_tree(r.deal_dir(deal_id))
+    return {"deleted": True, "deal_id": deal_id}
 
 
 # --------------------------------------------------------------------------- documents
@@ -207,61 +278,11 @@ def list_documents(deal_id: str):
 
 
 # --------------------------------------------------------------------------- financial database
-@router.post("/deals/{deal_id}/financial/upload")
-def upload_csv(deal_id: str, file: UploadFile = File(...)):
-    r, s = repo(), get_settings()
-    r.get_deal(deal_id)
-    if not (file.filename or "").lower().endswith(".csv"):
-        raise AppError(422, "invalid_csv", "Only .csv files are accepted.")
-    data = file.file.read(int(s.max_csv_mb * 1024 * 1024) + 1)
-    if len(data) > s.max_csv_mb * 1024 * 1024:
-        raise AppError(413, "too_large", f"The CSV is larger than the {s.max_csv_mb:g} MB limit.")
-    with deal_lock(deal_id):
-        r.write_bytes(deal_id, "financial/source.csv", data)
-        deal = r.get_deal(deal_id)
-        deal["financial"]["source"] = file.filename
-        r.save_deal(deal)
-    return {"source": file.filename}
-
-
-class LoadRequest(BaseModel):
-    confirm: bool | None = None
-
-
-@router.post("/deals/{deal_id}/financial/load")
-def load_financial(deal_id: str, req: LoadRequest):
-    r, s = repo(), get_settings()
-    deal = r.get_deal(deal_id)
-    custom = r.path(deal_id, "financial", "source.csv")
-    path = custom if custom.exists() else s.financial_db_path
-    try:
-        res = load_csv(path, deal["intake"]["DI-BORROWER"]["display"], req.confirm, s.large_swing, s.stable_band)
-    except LoadError as exc:
-        raise AppError(422, "csv_load_failed", str(exc)) from exc
-    if res["status"] == "needs_confirmation":
-        return res
-    ds = res["dataset"]
-    if custom.exists():
-        ds["file_name"] = deal["financial"].get("source") or ds["file_name"]
-        for e in res["evidence"].values():
-            e["file_name"] = ds["file_name"]
-    with deal_lock(deal_id):
-        r.append_audit(deal_id, {"type": "financial_loaded", "analyst_name": "System", "file_name": ds["file_name"],
-                                 "confirmed_whole_file": req.confirm, "values": len(res["evidence"])})
-        r.write(deal_id, "financial/dataset.json", ds)
-        r.write(deal_id, "financial/csv_evidence.json", res["evidence"])
-        deal = r.get_deal(deal_id)
-        deal["financial"].update({"status": "loaded", "confirmed": bool(req.confirm), "file_name": ds["file_name"], "loaded_at": now_iso()})
-        Repo.mark_later_stale(deal, "financial")
-        r.save_deal(deal)
-    return {"status": "ok", "dataset": ds, "defaults_applied": s.defaults_applied}
-
-
 @router.get("/deals/{deal_id}/financial")
 def get_financial(deal_id: str):
     ds = repo().read(deal_id, "financial/dataset.json")
     if not ds:
-        raise AppError(404, "no_dataset", "The financial database CSV must be loaded first.")
+        raise AppError(404, "no_dataset", "The financial database is not connected for this deal.")
     return ds
 
 
@@ -269,7 +290,7 @@ def get_financial(deal_id: str):
 def dashboard(deal_id: str):
     ds = repo().read(deal_id, "financial/dataset.json")
     if not ds:
-        raise AppError(404, "no_dataset", "The financial database CSV must be loaded first.")
+        raise AppError(404, "no_dataset", "The financial database is not connected for this deal.")
     return build_dashboard(ds)
 
 
