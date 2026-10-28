@@ -133,26 +133,13 @@ def _page_chars(page: fitz.Page) -> tuple[str, list[tuple | None], list[int]]:
     return "".join(chars), rects, lines
 
 
-def locate(pdf_path: Path | None, page_no: int, excerpt: str, page_count: int | None) -> dict:
-    """Search only the cited page for the normalised excerpt (Req 7.2-7.5, 7.9)."""
-    if pdf_path is None or not Path(pdf_path).exists():
-        return {"status": "Not located", "rects": [], "issue": "Invalid reference: unknown document"}
-    if page_count is not None and not (1 <= page_no <= page_count):
-        return {"status": "Not located", "rects": [], "issue": "Invalid reference: page out of range"}
-    needle = normalise(excerpt or "")
-    if not needle:
-        return {"status": "Not located", "rects": [], "issue": "Empty excerpt"}
-    doc = open_pdf(Path(pdf_path))
-    try:
-        if not (1 <= page_no <= doc.page_count):
-            return {"status": "Not located", "rects": [], "issue": "Invalid reference: page out of range"}
-        text, rects, lines = _page_chars(doc[page_no - 1])
-    finally:
-        doc.close()
+def _match_on_page(page: fitz.Page, needle: str) -> list[list[float]] | None:
+    """Return highlight rects if the normalised needle is found on this page, else None."""
+    text, rects, lines = _page_chars(page)
     hay, idx = normalise_with_map(text)
     pos = hay.find(needle)
     if pos < 0:
-        return {"status": "Not located", "rects": [], "issue": "Not located"}
+        return None
     by_line: dict[int, list[float]] = {}
     for k in range(pos, pos + len(needle)):
         src = idx[k]
@@ -162,7 +149,43 @@ def locate(pdf_path: Path | None, page_no: int, excerpt: str, page_count: int | 
         ln = lines[src]
         cur = by_line.get(ln)
         by_line[ln] = list(r) if cur is None else [min(cur[0], r[0]), min(cur[1], r[1]), max(cur[2], r[2]), max(cur[3], r[3])]
-    return {"status": "Located", "rects": [by_line[k] for k in sorted(by_line)], "issue": None}
+    return [by_line[k] for k in sorted(by_line)]
+
+
+def locate(pdf_path: Path | None, page_no: int, excerpt: str, page_count: int | None, window: int = 2) -> dict:
+    """Locate the normalised excerpt (Req 7.2-7.5, 7.9).
+
+    The AI cites the page number printed in the document text, but PyMuPDF reads by physical page index.
+    When a document has unnumbered front matter, the printed page and the physical page differ (e.g.
+    printed p.72 is physical p.70). So we search the cited page first, then widen to +/- `window`
+    neighbouring physical pages and report the physical page where the passage was actually found.
+    """
+    if pdf_path is None or not Path(pdf_path).exists():
+        return {"status": "Not located", "rects": [], "issue": "Invalid reference: unknown document", "located_page": None, "page_offset": 0}
+    if page_count is not None and not (1 <= page_no <= page_count):
+        return {"status": "Not located", "rects": [], "issue": "Invalid reference: page out of range", "located_page": None, "page_offset": 0}
+    needle = normalise(excerpt or "")
+    if not needle:
+        return {"status": "Not located", "rects": [], "issue": "Empty excerpt", "located_page": None, "page_offset": 0}
+    doc = open_pdf(Path(pdf_path))
+    try:
+        if not (1 <= page_no <= doc.page_count):
+            return {"status": "Not located", "rects": [], "issue": "Invalid reference: page out of range", "located_page": None, "page_offset": 0}
+        # Search the cited page first, then nearest neighbours outward (p, p-1, p+1, p-2, p+2, ...).
+        candidates = [page_no]
+        for d in range(1, window + 1):
+            candidates += [page_no - d, page_no + d]
+        for cand in candidates:
+            if not (1 <= cand <= doc.page_count):
+                continue
+            rects = _match_on_page(doc[cand - 1], needle)
+            if rects is not None:
+                offset = cand - page_no
+                issue = None if offset == 0 else f"Located on physical page {cand} (cited page {page_no}); likely a page-numbering offset"
+                return {"status": "Located", "rects": rects, "issue": issue, "located_page": cand, "page_offset": offset}
+    finally:
+        doc.close()
+    return {"status": "Not located", "rects": [], "issue": "Not located", "located_page": None, "page_offset": 0}
 
 
 def render_page_png(pdf_path: Path, page_no: int, rects: list[list[float]], dpi: int = 150) -> bytes:

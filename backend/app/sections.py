@@ -175,11 +175,13 @@ def _run_scope(repo, prompts, settings, deal_id, scope, pages, doc_list) -> str 
             meta = doc_meta.get(item["doc_id"])
             pdf = repo.path(deal_id, "documents", f"{item['doc_id']}.pdf") if meta else None
             loc = docs.locate(pdf, item["page"], item["excerpt"], meta["page_count"] if meta else None)
-            issues = [] if loc["status"] == "Located" else [loc["issue"]]
+            issues = [loc["issue"]] if loc["issue"] else []
             evidence[ev_id] = {"evidence_id": ev_id, "type": "document", "scope": scope, "field": item["field"],
                                "field_label": dict(cfg["fields"])[item["field"]], "statement": item["statement"].strip(),
+                               "original_statement": item["statement"].strip(), "status": "Pending",
                                "doc_id": item["doc_id"], "doc_name": meta["display_name"] if meta else item["doc_id"],
-                               "page": item["page"], "section_heading": item["section_heading"].strip(),
+                               "page": item["page"], "located_page": loc["located_page"], "page_offset": loc.get("page_offset", 0),
+                               "section_heading": item["section_heading"].strip(),
                                "excerpt": item["excerpt"].strip(), "location_status": loc["status"], "rects": loc["rects"],
                                "issues": issues, "review_flag": loc["status"] != "Located",
                                "item_key": item.get("item_key"), "as_of": item.get("as_of"), "created_at": now_iso()}
@@ -482,6 +484,7 @@ def run_section5(repo: Repo, prompts, settings, deal_id: str) -> dict:
     missing_gaps, anomaly_gaps = _gap_statements(ds, s3, s4)
     verified_csv = {r for s in s3["statements"] if s["status"] == "Approved" and s["verification"]["mark"] == "Numbers verified"
                     for r in s["refs"] if r.startswith("CSV-")}
+    approved_ev = {k for k, e in ctx["evidence"].items() if e.get("status") == "Approved"}
     titles = {n: (t, dict(subs)) for n, t, subs in MEMO_OUTLINE}
     statements, n = [], 0
     for sec in res["output"]["sections"]:
@@ -499,7 +502,7 @@ def run_section5(repo: Repo, prompts, settings, deal_id: str) -> dict:
                 items = [st for st in items if st["text"].strip() != PLACEHOLDER] + extra
             for st in items:
                 n += 1
-                statements.append(_memo_statement(f"M{n}", sec["number"], titles[sec["number"]], ss["key"], st, ctx, verified_csv))
+                statements.append(_memo_statement(f"M{n}", sec["number"], titles[sec["number"]], ss["key"], st, ctx, verified_csv, approved_ev))
     unknown = {e for _, e in res.get("unknown_refs", [])}
     for st in statements:
         bad = [r for r in st["refs"] if r in unknown or r not in ctx["known"]]
@@ -522,7 +525,7 @@ def run_section5(repo: Repo, prompts, settings, deal_id: str) -> dict:
     return repo.read(deal_id, "s5.json")
 
 
-def _memo_statement(sid, number, titles, key, st, ctx, verified_csv) -> dict:
+def _memo_statement(sid, number, titles, key, st, ctx, verified_csv, approved_ev) -> dict:
     v = verify_statement(st, ctx, "S5")
     status, note, carried_over = "Pending", None, False
     refs = st["refs"]
@@ -532,6 +535,9 @@ def _memo_statement(sid, number, titles, key, st, ctx, verified_csv) -> dict:
         only_csv = verify_statement({"text": st["text"], "refs": refs}, {"csv": ctx["csv"], "comparisons": ctx["comparisons"]}, "S3")
         if only_csv["mark"] == "Numbers verified":
             status, note, carried_over = "Approved", "Verified in Section 3 financial review", True
+    elif refs and all(r.startswith("EV-") and r in approved_ev for r in refs):
+        # Every cited document evidence item was approved by the analyst in Section 2.
+        status, note, carried_over = "Approved", "Approved in Section 2", True
     return {"id": sid, "section": number, "section_title": titles[0], "subsection": key, "subsection_title": titles[1][key],
             "text": st["text"], "original_text": st["text"], "label": st["label"], "refs": refs, "source": st["source"],
             "status": status, "note": note, "carried_over": carried_over, "verification": v, "activated": []}

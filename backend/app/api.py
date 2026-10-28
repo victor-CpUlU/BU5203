@@ -299,6 +299,12 @@ class ScopesRequest(BaseModel):
     scopes: list[str] = ["business", "debt"]
 
 
+class ActionRequest(BaseModel):
+    action: str
+    analyst_name: str | None = None
+    text: str | None = None
+
+
 @router.post("/deals/{deal_id}/section2/run")
 def run_s2(deal_id: str, req: ScopesRequest, request: Request):
     scopes = [x for x in req.scopes if x in sections.SCOPES] or ["business", "debt"]
@@ -312,6 +318,11 @@ def get_s2(deal_id: str):
     return {"s2": r.read(deal_id, "s2.json", {}), "evidence": r.read(deal_id, "evidence.json", {})}
 
 
+@router.post("/deals/{deal_id}/section2/evidence/{ev_id}/action")
+def s2_evidence_action(deal_id: str, ev_id: str, req: ActionRequest):
+    return review.s2_action(repo(), deal_id, ev_id, req.action, req.analyst_name, req.text)
+
+
 @router.post("/deals/{deal_id}/section3/run")
 def run_s3(deal_id: str, request: Request):
     return sections.run_section3(repo(), prompts(request), get_settings(), deal_id)
@@ -320,12 +331,6 @@ def run_s3(deal_id: str, request: Request):
 @router.get("/deals/{deal_id}/section3")
 def get_s3(deal_id: str):
     return repo().read(deal_id, "s3.json") or {}
-
-
-class ActionRequest(BaseModel):
-    action: str
-    analyst_name: str | None = None
-    text: str | None = None
 
 
 @router.post("/deals/{deal_id}/section3/statements/{sid}/action")
@@ -345,6 +350,11 @@ class BulkRequest(BaseModel):
 @router.post("/deals/{deal_id}/section3/bulk")
 def s3_bulk_action(deal_id: str, req: BulkRequest):
     return review.s3_bulk(repo(), deal_id, req.action, req.analyst_name)
+
+
+@router.post("/deals/{deal_id}/section2/bulk")
+def s2_bulk_action(deal_id: str, req: BulkRequest):
+    return review.s2_bulk(repo(), deal_id, req.action, req.analyst_name)
 
 
 @router.post("/deals/{deal_id}/section3/approve")
@@ -382,6 +392,11 @@ def get_s5(deal_id: str):
 @router.post("/deals/{deal_id}/memo/statements/{sid}/action")
 def memo_statement_action(deal_id: str, sid: str, req: ActionRequest):
     return review.memo_action(repo(), deal_id, sid, req.action, req.analyst_name, req.text)
+
+
+@router.post("/deals/{deal_id}/memo/bulk")
+def memo_bulk_action(deal_id: str, req: BulkRequest):
+    return review.memo_bulk(repo(), deal_id, req.action, req.analyst_name)
 
 
 @router.get("/deals/{deal_id}/evidence/{ev_id}")

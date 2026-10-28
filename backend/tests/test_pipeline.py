@@ -19,7 +19,7 @@ def test_full_pipeline(env, fake_llm):
     deal = c.post("/api/deals", json=INTAKE).json()
     did = deal["deal_id"]
     assert deal["intake"]["DI-COLLATERAL"]["display"] == "None provided" and deal["intake"]["DI-AMOUNT"]["display"] == "500000000 USD"
-    # Section 2D: the external financial database is auto-connected at deal creation (no analyst action)
+    # Section 2C: the external financial database is auto-connected at deal creation (no analyst action)
     assert deal["financial"]["status"] == "connected" and deal["financial"]["confirmed"] is True
     fin = c.get(f"/api/deals/{did}/financial").json()
     assert "Database has no borrower identifier" in fin["information_gaps"]
@@ -46,6 +46,26 @@ def test_full_pipeline(env, fake_llm):
     s2 = c.get(f"/api/deals/{did}/section2").json()
     evs = list(s2["evidence"].values())
     assert {e["evidence_id"] for e in evs} == {"EV-001", "EV-002"} and all(e["location_status"] == "Located" for e in evs)
+    assert all(e["status"] == "Pending" for e in evs)  # items start Pending
+
+    # Section 2 bulk approve: approves every pending item; name is required
+    assert c.post(f"/api/deals/{did}/section2/bulk", json={"action": "approve_pending", "analyst_name": ""}).status_code == 422
+    bulk2 = c.post(f"/api/deals/{did}/section2/bulk", json={"action": "approve_pending", "analyst_name": "Ana"}).json()
+    assert bulk2["changed"] == 2
+    assert all(e["status"] == "Approved" for e in c.get(f"/api/deals/{did}/section2").json()["evidence"].values())
+
+    # Section 2 review: approve one item, edit the other (edit resets to Pending and re-checks the passage)
+    assert c.post(f"/api/deals/{did}/section2/evidence/EV-001/action", json={"action": "approve", "analyst_name": ""}).status_code == 422
+    ap = c.post(f"/api/deals/{did}/section2/evidence/EV-001/action", json={"action": "approve", "analyst_name": "Ana"}).json()
+    assert ap["status"] == "Approved"
+    ed = c.post(f"/api/deals/{did}/section2/evidence/EV-002/action",
+                json={"action": "edit", "analyst_name": "Ana", "text": "Intel had senior notes outstanding."}).json()
+    assert ed["status"] == "Pending" and ed["statement"] == "Intel had senior notes outstanding."
+    # flag is available too (same format as the other sections) and keeps a note
+    fl = c.post(f"/api/deals/{did}/section2/evidence/EV-002/action", json={"action": "flag", "analyst_name": "Ana", "text": "double-check figure"}).json()
+    assert fl["status"] == "Flagged" and fl["note"] == "double-check figure"
+    # approve it again so it can carry over to the memo
+    c.post(f"/api/deals/{did}/section2/evidence/EV-002/action", json={"action": "approve", "analyst_name": "Ana"})
 
     # Section 4 is gated on Section 3 approval
     assert c.post(f"/api/deals/{did}/section4/run").status_code == 409
@@ -86,6 +106,10 @@ def test_full_pipeline(env, fake_llm):
     assert {s["section"] for s in sts} == set(range(1, 8))
     assert any("Pro-forma debt service" in s["text"] and s["label"] == "NOT VERIFIED" for s in sts)
     assert any(s["subsection"] == "conflicting_information" and "zero value" in s["text"] for s in sts)
+    # A memo statement citing only EV- items approved in Section 2 carries over as "Approved in Section 2"
+    carried = [s for s in sts if s.get("note") == "Approved in Section 2"]
+    assert carried and all(s["status"] == "Approved" and s["carried_over"] for s in carried)
+    assert all(all(r.startswith("EV-") for r in s["refs"]) for s in carried)
 
     # Section 6: final PDF blocked while statements are Pending
     pending = c.post(f"/api/deals/{did}/exports/memo", json={"analyst_name": "Ana"})
@@ -95,9 +119,12 @@ def test_full_pipeline(env, fake_llm):
     assert src["location_status"] == "Located" and src["image"].startswith("data:image/png;base64,")
     csv_src = c.get(f"/api/deals/{did}/evidence/CSV-DSCR-Q1-2026").json()
     assert csv_src["display"] == "0.00x" and "zero value" in csv_src["flags"]
-    for s in sts:
-        if s["status"] == "Pending":
-            assert c.post(f"/api/deals/{did}/memo/statements/{s['id']}/action", json={"action": "approve", "analyst_name": "Ana"}).status_code == 200
+    # Section 6 bulk approve: approves every Pending statement (name required); carried-over ones are already Approved
+    assert c.post(f"/api/deals/{did}/memo/bulk", json={"action": "approve_pending", "analyst_name": ""}).status_code == 422
+    pending_before = sum(1 for s in sts if s["status"] == "Pending")
+    bulk6 = c.post(f"/api/deals/{did}/memo/bulk", json={"action": "approve_pending", "analyst_name": "Ana"}).json()
+    assert bulk6["changed"] == pending_before
+    assert all(s["status"] != "Pending" for s in c.get(f"/api/deals/{did}/section5").json()["statements"])
     corrected = c.post(f"/api/deals/{did}/memo/statements/{business['id']}/action",
                        json={"action": "correct", "analyst_name": "Ana", "text": "Intel designs and manufactures semiconductors."}).json()
     assert corrected["status"] == "Pending"

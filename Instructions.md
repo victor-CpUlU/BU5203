@@ -68,6 +68,8 @@ Only these are used. Metrics named in the Project Details but absent from the CS
 
 ### 4.4 Anomaly flags (values are never changed)
 
+These flags are computed **deterministically by the backend** (`apply_anomaly_flags` in `financial.py`) when the financial database is loaded, using the fixed numeric rules below (thresholds come from `config/analysis.toml`). The LLM does not decide or compute any flag: it receives the backend's flags as input and may only quote them in its commentary. This table documents the backend's logic; it is not a prompt.
+
 | Flag | Trigger |
 |---|---|
 | unparseable value | Cell is empty or not a number with an optional `%` or `x` suffix |
@@ -76,7 +78,7 @@ Only these are used. Metrics named in the Project Details but absent from the CS
 | large swing | Change from the previous quarter above: 10.0 pp (percent), 2.0x (multiple), 5.0 days (days), 50% of the earlier value (amount) |
 | unit not stated | Plain amounts with no stated unit (Operating Cash Flow, Working Capital) |
 
-Stable band (change labelled `~`): 1.0 pp, 0.10x, 3 days, 5% relative. These are labelling tolerances, not credit benchmarks.
+Stable band (change labelled `~`): 1.0 pp, 0.10x, 3 days, 5% relative. These are labelling tolerances, not credit benchmarks, and are also applied by the backend, not the LLM.
 
 ### 4.5 Section 6 verification in the app
 

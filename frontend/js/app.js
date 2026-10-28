@@ -37,6 +37,8 @@ function h(tag, attrs = {}, ...kids) {
 const tag = (text, kind = "info") => h("span", { class: `tag ${kind}` }, text);
 const statusKind = (s) => ({ Approved: "ok", Flagged: "bad", Pending: "warn" }[s] || "muted");
 const labelKind = (l) => ({ Sourced: "ok", ASSUMPTION: "warn", "NOT VERIFIED": "bad" }[l] || "muted");
+// Sleek, consistent display of the raw backend label (matches the PDF's title-case wording).
+const labelText = (l) => ({ Sourced: "Sourced", ASSUMPTION: "Assumption", "NOT VERIFIED": "Not verified" }[l] || l);
 const analyst = () => $name.value.trim();
 
 function announce(msg) {
@@ -405,10 +407,10 @@ async function renderSource(container, evId, statementId) {
       container.replaceChildren(h("h3", {}, `Source for ${evId}`), h("table", {}, h("tbody", {}, rows)));
     } else {
       row("Evidence ID", s.evidence_id); row("Document", `${s.doc_id} ${s.doc_name}`); row("Page", String(s.page)); row("Section", s.section_heading);
-      row("Extracted statement", s.statement); row("Supporting text", `\u201c${s.excerpt}\u201d`);
+      row("Generated Statement", s.statement); row("Extracted Text", `\u201c${s.excerpt}\u201d`);
       row("Passage on page", s.location_status === "Located" ? tag("Located (highlighted below)", "ok") : tag(s.location_status, "bad"));
       container.replaceChildren(h("h3", {}, `Source for ${evId}`), h("table", {}, h("tbody", {}, rows)),
-        s.image ? h("img", { src: s.image, alt: `Page ${s.page} of ${s.doc_name}${s.location_status === "Located" ? " with the supporting passage highlighted" : ""}`, style: "margin-top:10px" })
+        s.image ? h("img", { src: s.image, alt: `Page ${s.page} of ${s.doc_name}${s.location_status === "Located" ? " with the extracted text highlighted" : ""}`, style: "margin-top:10px" })
           : h("p", { class: "muted" }, "The source document or page is unavailable."));
     }
     announce(`Source for ${evId} shown`);
@@ -447,6 +449,46 @@ async function screenExtraction() {
     return b;
   };
   const sec = deal.sections;
+  const s2Action = async (evId, action, text, btn) => {
+    if (needName()) return;
+    try {
+      await busy(btn, "Saving...", () => api("POST", `/deals/${deal.deal_id}/section2/evidence/${encodeURIComponent(evId)}/action`, { action, analyst_name: analyst(), text }));
+      announce(`${evId} ${action} saved`);
+      await rerender();
+    } catch (e) { /* shown */ }
+  };
+  const s2EvRow = (f, e, id, showLabel) => {
+    const located = e.location_status === "Located";
+    const actions = h("td", { class: "s2-actions" });
+    const tr = h("tr", {},
+      h("td", {}, showLabel ? f.label : ""),
+      h("td", {}, evButton(id, null, sourceDialog)),
+      h("td", { class: "stmt-cell" }, h("div", {}, e.statement),
+        e.original_statement && e.statement !== e.original_statement ? h("div", { class: "small muted" }, "Edited. AI original: ", e.original_statement) : null,
+        e.status === "Flagged" && e.note ? h("div", { class: "flag-note" }, "Flag note: ", e.note) : null),
+      h("td", {}, e.doc_name),
+      h("td", {}, String(e.page)),
+      h("td", {}, tag(located ? "Located" : "Review", located ? "ok" : "bad"),
+        e.issues && e.issues.length ? h("div", { class: "small muted", style: "margin-top:2px" }, e.issues.join("; ")) : null),
+      h("td", {}, tag(e.status || "Pending", statusKind(e.status || "Pending"))),
+      actions);
+    const ap = h("button", { type: "button", class: "small" }, "Approve");
+    ap.addEventListener("click", (ev) => s2Action(id, "approve", null, ev.currentTarget));
+    const editor = (kind) => {
+      actions.querySelector(".editor")?.remove();
+      const ta = h("textarea", { "aria-label": kind === "edit" ? `Edit ${id}` : `Flag note for ${id}`, maxlength: kind === "edit" ? 2000 : 500 }, kind === "edit" ? e.statement : "");
+      const save = h("button", { type: "button", class: "small" }, kind === "edit" ? "Save edit" : "Flag with note");
+      save.addEventListener("click", (ev) => s2Action(id, kind === "edit" ? "edit" : "flag", ta.value, ev.currentTarget));
+      const ed = h("div", { class: "editor" }, ta, h("div", { class: "row" }, save, h("button", { type: "button", class: "small secondary", onclick: () => ed.remove() }, "Cancel")));
+      actions.append(ed); ta.focus();
+    };
+    const fl = h("button", { type: "button", class: "small secondary" }, "Flag");
+    fl.addEventListener("click", () => editor("flag"));
+    const ed = h("button", { type: "button", class: "small secondary" }, "Edit");
+    ed.addEventListener("click", () => editor("edit"));
+    actions.append(h("div", { class: "row" }, ap, fl, ed));
+    return tr;
+  };
   const group = (scope, title, key) => {
     const s2 = data.s2[scope];
     const st = sec[key];
@@ -456,26 +498,42 @@ async function screenExtraction() {
     const rows = [];
     for (const f of s2.fields) {
       const ids = f.evidence_ids;
-      if (!ids.length) rows.push(h("tr", {}, h("td", {}, f.label), h("td", {}, "None"), h("td", { colspan: 4 }, tag("Not available", "muted")), h("td", {}, f.issues.filter((x) => x !== "Not available").map((x) => tag(x, "bad")))));
+      if (!ids.length) rows.push(h("tr", {}, h("td", {}, f.label), h("td", {}, "None"), h("td", { colspan: 6 }, tag("Not available", "muted"))));
       ids.forEach((id, i) => {
         const e = data.evidence[id];
         if (!e) return;
-        rows.push(h("tr", {}, h("td", {}, i === 0 ? f.label : ""), h("td", {}, evButton(id, null, sourceDialog)), h("td", {}, e.statement),
-          h("td", {}, e.doc_name), h("td", {}, String(e.page)), h("td", {}, e.location_status === "Located" ? tag("Located", "ok") : tag("Not located: review", "bad")),
-          h("td", {}, e.issues.map((x) => tag(x, "bad")))));
+        rows.push(s2EvRow(f, e, id, i === 0));
       });
-      if (f.rejected.length) rows.push(h("tr", {}, h("td", {}), h("td", { colspan: 6 }, h("details", {}, h("summary", {}, `${f.rejected.length} rejected item(s) for ${f.label}`),
+      if (f.rejected.length) rows.push(h("tr", {}, h("td", {}), h("td", { colspan: 7 }, h("details", {}, h("summary", {}, `${f.rejected.length} rejected item(s) for ${f.label}`),
         h("ul", {}, f.rejected.map((r) => h("li", {}, `${r.statement} (${r.doc_id} p.${r.page}): ${r.reason}`)))))));
     }
-    return h("div", { class: "card" }, head, s2.message ? h("p", { class: "tag warn" }, s2.message) : null,
-      h("table", {}, h("thead", {}, h("tr", {}, ["Field", "Evidence ID", "Statement", "Document", "Page", "Passage", "Issues"].map((x) => h("th", {}, x)))), h("tbody", {}, rows)));
+    const cols = ["13%", "9%", "30%", "12%", "5%", "9%", "8%", "14%"].map((w) => h("col", { style: `width:${w}` }));
+    return h("div", { class: "card" }, head,
+      h("p", { class: "small muted" }, "Approve each item you accept, or Edit its generated statement (editing re-checks the passage and resets it to Pending). Items you approve here are shown as \u201cApproved in Section 2\u201d in the memo review."),
+      s2.message ? h("p", { class: "tag warn" }, s2.message) : null,
+      h("div", { class: "table-wrap" },
+        h("table", { class: "s2-table" }, h("colgroup", {}, cols),
+          h("thead", {}, h("tr", {}, ["Field", "Evidence ID", "Generated Statement", "Document", "Page", "Passage", "Status", "Actions"].map((x) => h("th", {}, x)))),
+          h("tbody", {}, rows))));
   };
   const finCard = await financialCard(deal);
+  const docEv = Object.values(data.evidence || {}).filter((e) => e.type === "document");
+  const pendingEv = docEv.filter((e) => (e.status || "Pending") === "Pending").length;
+  const bulkBtn = h("button", { type: "button", class: "secondary", disabled: pendingEv === 0 }, `Approve all pending (${pendingEv})`);
+  bulkBtn.addEventListener("click", async () => {
+    if (needName() || !window.confirm(`Approve ${pendingEv} pending extraction item(s)?\n\nThis confirms you accept them as extracted. Each approval is recorded in the audit trail under your name.`)) return;
+    try {
+      const r = await busy(bulkBtn, "Saving...", () => api("POST", `/deals/${deal.deal_id}/section2/bulk`, { action: "approve_pending", analyst_name: analyst() }));
+      toast(`${r.changed} item(s) approved. Each is recorded in the audit trail under your name.`, true);
+      await rerender();
+    } catch (e) { /* shown */ }
+  });
   $main.replaceChildren(
     h("h2", {}, "Section 2: Extract and organise the relevant information"),
     h("div", { class: "card" },
-      h("p", {}, "The AI reads the uploaded documents and extracts business information (2A) and debt and financing information (2B). Each item gets an Evidence ID and its supporting passage is checked on the cited page with PyMuPDF. Financial figures (2C) are not extracted by the AI; they are fetched automatically from the external financial database."),
-      deal.documents.length ? h("div", { class: "row" }, run(["business", "debt"], "Run extraction (2A and 2B)"), run(["business"], "Re-run 2A only"), run(["debt"], "Re-run 2B only"))
+      h("p", {}, "The AI reads the uploaded documents and extracts business information (2A) and debt and financing information (2B). Each item gets an Evidence ID and its extracted text is located on the cited page with PyMuPDF. Financial figures (2C) are not extracted by the AI; they are fetched automatically from the external financial database."),
+      deal.documents.length ? h("div", { class: "row" }, run(["business", "debt"], "Run extraction (2A and 2B)"), run(["business"], "Re-run 2A only"), run(["debt"], "Re-run 2B only"),
+        docEv.length ? h("span", { class: "spacer" }) : null, docEv.length ? bulkBtn : null)
         : h("p", { class: "tag warn" }, "Upload at least one PDF in Section 1 first.")),
     group("business", "2A Business information", "s2a"),
     group("debt", "2B Debt and financing information", "s2b"),
@@ -547,11 +605,11 @@ function dataTable(panel, periods) {
 
 function s3Statement(st, approved) {
   const box = h("div", { class: `stmt ${st.status}`, id: `st-${st.id}` });
-  const meta = h("div", { class: "meta" }, h("code", {}, st.id), tag(st.label, labelKind(st.label)),
+  const meta = h("div", { class: "meta" }, h("code", {}, st.id), tag(labelText(st.label), labelKind(st.label)),
     tag(st.verification.mark, st.verification.mark === "Numbers verified" ? "ok" : "bad"), tag(st.status, statusKind(st.status)),
     st.refs.map((r) => evButton(r, null, sourceDialog)));
   box.append(h("div", {}, st.text), meta);
-  if (st.text !== st.original_text) box.append(h("div", { class: "small muted" }, "Edited. Original: ", st.original_text));
+  if (st.text !== st.original_text) box.append(h("div", { class: "small muted" }, "Edited. AI original: ", st.original_text));
   if (st.verification.unmatched.length) box.append(h("div", { class: "unmatched" }, "Not matched: " + st.verification.unmatched.map((u) => `${u.value} (${u.reason})`).join("; ")));
   if (st.comments.length) box.append(h("ul", { class: "small" }, st.comments.map((c) => h("li", {}, `${c.analyst_name}: ${c.text}`))));
   const act = async (action, text, btn) => {
@@ -710,7 +768,7 @@ async function screenRisks() {
           h("div", { class: "small muted" }, "Time horizon: ", r.time_horizon),
           r.business_context ? h("div", { class: "small" }, "Context: ", r.business_context.text, " ", r.business_context.refs.map((x) => evButton(x, null, sourceDialog))) : null),
         h("td", {}, h("ul", {}, r.mitigants.map((m) => h("li", {}, m)))),
-        h("td", {}, h("ul", {}, r.terms.map((t) => h("li", {}, tag(t.term_type, "info"), " ", t.text, " ", tag(t.label, labelKind(t.label)))))))) :
+        h("td", {}, h("ul", {}, r.terms.map((t) => h("li", {}, tag(t.term_type, "info"), " ", t.text, " ", tag(labelText(t.label), labelKind(t.label)))))))) :
         h("tr", {}, h("td", { colspan: 4 }, "No risks supported by the evidence provided.")))));
     if (s4.limitations.length) body.push(h("h4", {}, "Limitations"), h("ul", {}, s4.limitations.map((l) => h("li", {}, l))));
   } else body.push(h("p", { class: "empty" }, "Not run yet."));
@@ -722,24 +780,36 @@ async function screenRisks() {
 function memoStatement(st, review, openSource) {
   const box = h("div", { class: `stmt ${st.status}${state.activeStatement === st.id ? " active" : ""}`, id: `m-${st.id}` });
   box.append(h("div", {}, st.text),
-    h("div", { class: "meta" }, h("code", {}, st.id), tag(st.label, labelKind(st.label)), tag(st.status, statusKind(st.status)),
+    h("div", { class: "meta" }, h("code", {}, st.id), tag(labelText(st.label), labelKind(st.label)), tag(st.status, statusKind(st.status)),
       tag(st.verification.mark, st.verification.mark === "Numbers verified" ? "ok" : "bad"),
       st.source === "backend" ? tag("Backend-generated", "muted") : null,
       st.refs.length ? st.refs.map((r) => evButton(r, st.id, openSource)) : h("span", { class: "muted" }, "No references")));
-  if (st.note) box.append(h("div", { class: "small", style: "margin-top:4px" }, "Note: ", st.note));
+  // The carried-over badge (shown below in review mode) already states the note, so don't repeat it here.
+  const carriedOver = st.carried_over && st.status === "Approved";
+  if (st.note && !carriedOver) box.append(h("div", { class: "note-line" }, "Note: ", st.note));
   if (st.verification.unmatched.length) box.append(h("div", { class: "unmatched" }, "Not matched: " + st.verification.unmatched.map((u) => `${u.value} (${u.reason})`).join("; ")));
   if (st.text !== st.original_text) box.append(h("div", { class: "small muted" }, "Edited. AI original: ", st.original_text));
   if (review && state.status.support_check_enabled) {
-    box.append(h("div", { class: "small", style: "margin-top:4px" }, st.support ? [tag(st.support.assessment, st.support.assessment === "Supported" ? "ok" : st.support.assessment === "Not supported" ? "bad" : "warn"),
+    box.append(h("div", { class: "note-line" }, st.support ? [tag(st.support.assessment, st.support.assessment === "Supported" ? "ok" : st.support.assessment === "Not supported" ? "bad" : "warn"),
       " ", st.support.reason, " ", h("span", { class: "muted" }, "(AI preliminary check; analyst verification required)")] : h("span", { class: "muted" }, "AI support check: Not checked")));
   }
   if (!review) return box;
-  // Already approved in an earlier section (Section 3 financial review or backend-generated from the
-  // database): no need to make the analyst approve the same point again. Show a note instead of buttons.
-  if (st.carried_over && st.status === "Approved") {
-    box.append(h("div", { class: "carried-over" },
-      tag("\u2713 Approved in Section 3", "ok"),
-      h("span", { class: "small muted" }, "Carried over from the financial review \u2014 no action needed here. Click an Evidence ID to inspect the source.")));
+  // Already approved in an earlier section (Section 2 extraction, Section 3 financial review, or
+  // backend-generated from the database): no need to approve the same point again. Show a badge, not buttons.
+  if (carriedOver) {
+    const note = st.note || "";
+    let badge, detail;
+    if (note.startsWith("Approved in Section 2")) {
+      badge = "\u2713 Approved in Section 2";
+      detail = "Carried over from the Section 2 extraction review \u2014 no action needed here. Click an Evidence ID to inspect the source.";
+    } else if (note.startsWith("Verified in Section 3")) {
+      badge = "\u2713 Approved in Section 3";
+      detail = "Carried over from the Section 3 financial review \u2014 no action needed here. Click an Evidence ID to inspect the source.";
+    } else {
+      badge = "\u2713 Backend-generated";
+      detail = "Generated by the backend from the financial database (not AI-written) \u2014 no action needed here. Click an Evidence ID to inspect the source.";
+    }
+    box.append(h("div", { class: "carried-over" }, tag(badge, "ok"), h("span", { class: "small muted" }, detail)));
     return box;
   }
   const act = async (action, text, btn) => {
@@ -793,14 +863,81 @@ async function screenMemo() {
     try { await busy(runBtn, "The AI is writing the memo; the backend is checking every reference and figure...", () => api("POST", `/deals/${deal.deal_id}/section5/run`)); await rerender(); } catch (e) { }
   });
   const st = deal.sections.s5;
-  $main.replaceChildren(h("h2", {}, "Section 5: Credit memo with evidence"),
-    h("div", { class: "card" }, h("p", {}, "The memo uses only Sections 1-4 and cites existing Evidence IDs. Information gaps and flagged database values are added by the backend. There is no AI recommendation; the analyst decides."),
-      h("div", { class: "row" }, runBtn, deal.sections.s4.status === "completed" ? null : tag("Section 4 must be completed first", "warn"),
-        s5.statements ? h("a", { href: `#/deal/${deal.deal_id}/review` }, "Go to Section 6 review") : null),
-      st.status === "stale" ? h("p", { class: "tag warn" }, "Out of date: an earlier section changed. Regenerate the memo.") : null,
-      st.last_error ? h("details", {}, h("summary", {}, "Last run failed"), h("ul", {}, st.last_error.map((x) => h("li", {}, x)))) : null),
-    s5.statements ? h("div", { class: "card" }, memoBody(s5, false, (id) => sourceDialog(id))) : h("p", { class: "empty" }, "No memo yet."),
-    s5.statements ? nextSection(deal.deal_id, "review") : null);
+  const topCard = h("div", { class: "card" },
+    h("p", {}, "The memo uses only Sections 1-4 and cites existing Evidence IDs. Information gaps and flagged database values are added by the backend. There is no AI recommendation; the analyst decides."),
+    h("div", { class: "row" }, runBtn, deal.sections.s4.status === "completed" ? null : tag("Section 4 must be completed first", "warn")),
+    st.status === "stale" ? h("p", { class: "tag warn" }, "Out of date: an earlier section changed. Regenerate the memo.") : null,
+    st.last_error ? h("details", {}, h("summary", {}, "Last run failed"), h("ul", {}, st.last_error.map((x) => h("li", {}, x)))) : null);
+
+  if (!s5.statements) {
+    $main.replaceChildren(h("h2", {}, "Section 5: Credit memo"), topCard, h("p", { class: "empty" }, "No memo yet. Generate the credit memo to see the overview."));
+    return;
+  }
+
+  // ---- holding space: a compact overview so the analyst is oriented before reading the full memo ----
+  const [s3, s4, s2] = await Promise.all([api("GET", `/deals/${deal.deal_id}/section3`), api("GET", `/deals/${deal.deal_id}/section4`), api("GET", `/deals/${deal.deal_id}/section2`)]);
+  const evItems = Object.values((s2 && s2.evidence) || {}).filter((e) => e.type === "document");
+  const evCount = { total: evItems.length, Approved: 0, Flagged: 0, Pending: 0 };
+  evItems.forEach((e) => { evCount[e.status || "Pending"] = (evCount[e.status || "Pending"] || 0) + 1; });
+  const sts = s5.statements;
+  const by = (p) => sts.filter(p).length;
+  const counts = { Approved: by((s) => s.status === "Approved"), Pending: by((s) => s.status === "Pending"), Flagged: by((s) => s.status === "Flagged") };
+  const labels = { Sourced: by((s) => s.label === "Sourced"), ASSUMPTION: by((s) => s.label === "ASSUMPTION"), "NOT VERIFIED": by((s) => s.label === "NOT VERIFIED") };
+  const carried = by((s) => s.carried_over);
+  const i = deal.intake;
+  const risks = (s4 && s4.risks) || [];
+  const termCount = risks.reduce((n, r) => n + (r.terms ? r.terms.length : 0), 0);
+  const gapCount = by((s) => s.section === 7);
+  let dsFlagged = 0;
+  try { dsFlagged = (await api("GET", `/deals/${deal.deal_id}/financial`)).flagged_values.length; } catch (e) { /* ignore */ }
+
+  const kv = (label, value) => h("div", { class: "metric" }, h("div", { class: "metric-label" }, label), h("div", { class: "metric-value" }, h("b", {}, String(value))));
+  const kvText = (label, value) => h("div", { class: "metric" }, h("div", { class: "metric-label" }, label), h("div", { class: "metric-text" }, String(value)));
+  const snapshot = h("div", { class: "card" },
+    h("h3", {}, "Deal snapshot"),
+    h("div", { class: "latest" },
+      kvText("Borrower", i["DI-BORROWER"].display),
+      kvText("Facility", i["DI-FACILITY_TYPE"].display),
+      kvText("Amount", i["DI-AMOUNT"].display),
+      kvText("Tenor", i["DI-TENOR"].display)),
+    h("p", { class: "small muted", style: "margin-top:8px" }, "Purpose: ", i["DI-PURPOSE"].display));
+
+  const pipeline = h("div", { class: "card" },
+    h("h3", {}, "What has been analysed"),
+    h("ul", { class: "small" },
+      h("li", {}, `${deal.documents.length} document(s) uploaded; financial database ${deal.financial.status === "connected" || deal.financial.status === "loaded" ? "connected" : "not connected"}.`),
+      h("li", {}, !evCount.total
+        ? "Section 2 extraction not run yet."
+        : evCount.Approved === evCount.total
+          ? "Section 2 extraction approved."
+          : `Section 2 extraction not yet fully approved (${evCount.Approved} of ${evCount.total} items approved).`),
+      h("li", {}, deal.s3_approved ? `Section 3 financial analysis approved${s3 && s3.approval ? ` by ${s3.approval.analyst_name}` : ""}.` : "Section 3 financial analysis not yet approved."),
+      h("li", {}, `${risks.length} key risk(s) identified, with ${termCount} proposed covenant(s) / term(s).`),
+      h("li", {}, `${gapCount} information-gap statement(s); ${dsFlagged} database value(s) flagged for review.`)));
+
+  const needsReview = counts.Pending > 0;
+  const memoGlance = h("div", { class: "card" },
+    h("h3", {}, "Memo at a glance"),
+    h("div", { class: "latest" },
+      kv("Statements", sts.length),
+      kv("Approved", counts.Approved),
+      kv("Pending", counts.Pending),
+      kv("Flagged", counts.Flagged),
+      kv("Carried over", carried)),
+    h("p", { class: "small muted", style: "margin-top:8px" },
+      `Labels: ${labels.Sourced} Sourced, ${labels.ASSUMPTION} Assumption, ${labels["NOT VERIFIED"]} Not verified.`),
+    h("p", { class: needsReview ? "disclaimer" : "ready-line" },
+      needsReview ? `${counts.Pending} statement(s) still need review in Section 6 before the memo can be exported.`
+                  : "All statements reviewed. The memo is ready to export in Section 6."),
+    h("div", { class: "row" },
+      h("a", { href: `#/deal/${deal.deal_id}/review`, class: "button-link" }, needsReview ? "Go to Section 6 to review" : "Go to Section 6 to export")));
+
+  const fullMemo = h("details", { class: "card" },
+    h("summary", {}, "View full memo (all 7 sections)"),
+    h("div", { style: "margin-top:10px" }, memoBody(s5, false, (id) => sourceDialog(id))));
+
+  $main.replaceChildren(h("h2", {}, "Section 5: Credit memo"), topCard, snapshot, pipeline, memoGlance, fullMemo,
+    nextSection(deal.deal_id, "review"));
 }
 
 async function screenReview() {
@@ -832,7 +969,16 @@ async function screenReview() {
   memoBtn.addEventListener("click", () => { if (!needName()) download(`/deals/${deal.deal_id}/exports/memo`, { analyst_name: analyst() }, memoBtn).catch(() => null); });
   const auditBtn = h("button", { type: "button", class: "secondary" }, "Download Audit Trail PDF");
   auditBtn.addEventListener("click", () => download(`/deals/${deal.deal_id}/exports/audit`, {}, auditBtn).catch(() => null));
-  const tools = h("div", { class: "row" }, memoBtn, auditBtn,
+  const bulkBtn = h("button", { type: "button", class: "secondary", disabled: counts.Pending === 0 }, `Approve all pending (${counts.Pending})`);
+  bulkBtn.addEventListener("click", async () => {
+    if (needName() || !window.confirm(`Approve ${counts.Pending} pending statement(s)?\n\nThis confirms you have read them and agree. Read the commentary and check sources first; each approval is recorded in the audit trail under your name.`)) return;
+    try {
+      const r = await busy(bulkBtn, "Saving...", () => api("POST", `/deals/${deal.deal_id}/memo/bulk`, { action: "approve_pending", analyst_name: analyst() }));
+      toast(`${r.changed} statement(s) approved. Each is recorded in the audit trail under your name.`, true);
+      await rerender();
+    } catch (e) { /* shown */ }
+  });
+  const tools = h("div", { class: "row" }, memoBtn, auditBtn, bulkBtn,
     counts.Pending ? tag(`${counts.Pending} statement(s) still Pending: the final memo needs every statement Approved or Flagged`, "warn") : tag("Review complete", "ok"));
   if (state.status.support_check_enabled) {
     const sc = h("button", { type: "button", class: "secondary" }, "Run AI support check");

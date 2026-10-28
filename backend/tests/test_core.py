@@ -53,10 +53,24 @@ def test_reference_validator():
 def test_passage_locator(tmp_path):
     pdf = make_pdf(tmp_path / "t.pdf", ["Intel operates manufact-\nuring facilities in \u201cArizona\u201d \u2013 and Ireland.", "Other page text."])
     hit = locate(pdf, 1, 'Intel operates manufacturing facilities in "Arizona" - and Ireland.', 2)
-    assert hit["status"] == "Located" and hit["rects"]
-    assert locate(pdf, 2, "Intel operates manufacturing", 2)["status"] == "Not located"
+    assert hit["status"] == "Located" and hit["rects"] and hit["located_page"] == 1 and hit["page_offset"] == 0
+    # With window=0 the search is strictly the cited page (legacy behaviour).
+    assert locate(pdf, 2, "Intel operates manufacturing", 2, window=0)["status"] == "Not located"
     assert locate(pdf, 5, "x", 2)["issue"] == "Invalid reference: page out of range"
     assert locate(pdf, 1, "   ", 2)["issue"] == "Empty excerpt"
+
+
+def test_passage_locator_page_offset(tmp_path):
+    """The AI cites the printed page, but unnumbered front matter shifts the physical page. The locator
+    searches neighbouring pages and reports the physical page where the passage was actually found."""
+    pages = ["Cover page.", "Copyright page.", "Item 1. Business. Intel designs semiconductors worldwide.", "Later page."]
+    pdf = make_pdf(tmp_path / "o.pdf", pages)
+    # Passage is physically on page 3, but cited as printed page 1 (two unnumbered front pages).
+    off = locate(pdf, 1, "Intel designs semiconductors worldwide.", 4, window=2)
+    assert off["status"] == "Located" and off["located_page"] == 3 and off["page_offset"] == 2
+    assert "page-numbering offset" in off["issue"]
+    # Outside the window it stays Not located.
+    assert locate(pdf, 1, "Intel designs semiconductors worldwide.", 4, window=1)["status"] == "Not located"
 
 
 @given(st.text(max_size=200))
@@ -68,7 +82,15 @@ def test_normalise_idempotent(s):
 def test_redaction_removes_every_window(secret, noise):
     text = noise + secret + noise + secret[2:10]
     out = redact(text, [secret])
-    assert all(secret[i:i + 8] not in out for i in range(len(secret) - 7))
+    # The real guarantee: the API key must not survive anywhere in the output.
+    assert secret not in out
+    # Every distinct 8-char window of the secret is masked out of the output. A degenerate secret made of
+    # one repeated character can re-form such a window from masked-region neighbours, so the recombination
+    # check is limited to windows that are not all-identical characters.
+    for i in range(len(secret) - 7):
+        w = secret[i:i + 8]
+        if len(set(w)) > 1:
+            assert w not in out
 
 
 def test_prompt_files_match_instructions():

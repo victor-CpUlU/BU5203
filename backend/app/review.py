@@ -23,6 +23,69 @@ def valid_text(text: str | None, limit: int, field: str) -> str:
     return t
 
 
+# --------------------------------------------------------------------------- Section 2 (evidence review)
+def s2_action(repo: Repo, deal_id: str, ev_id: str, action: str, analyst: str | None, text: str | None = None) -> dict:
+    """Approve or edit a Section 2 evidence item. Approving lets a memo statement that cites only
+    approved EV- items carry over to Section 6 as 'Approved in Section 2'. Editing the statement
+    re-locates the passage on the cited page and resets the item to Pending."""
+    name = valid_name(analyst)
+    with deal_lock(deal_id):
+        deal = repo.get_deal(deal_id)
+        evidence = repo.read(deal_id, "evidence.json", {})
+        e = evidence.get(ev_id)
+        if e is None or e.get("type") != "document":
+            raise AppError(404, "evidence_not_found", "Evidence item not found.")
+        entry = {"type": "s2_review", "evidence_id": ev_id, "scope": e["scope"], "field": e["field"], "action": action,
+                 "analyst_name": name, "status_before": e.get("status", "Pending"), "text_before": e["statement"]}
+        if action == "approve":
+            entry["status_after"] = "Approved"
+            repo.append_audit(deal_id, entry)
+            e["status"], e["note"] = "Approved", None
+        elif action == "flag":
+            note = (text or "").strip()
+            if len(note) > 500:
+                raise AppError(422, "text_length", "The flag note must be at most 500 characters.")
+            entry.update({"status_after": "Flagged", "note": note})
+            repo.append_audit(deal_id, entry)
+            e["status"], e["note"] = "Flagged", note or "Flagged by analyst"
+        elif action == "edit":
+            new_text = valid_text(text, 2000, "edited statement")
+            meta = next((d for d in deal["documents"] if d["doc_id"] == e["doc_id"]), None)
+            pdf = repo.path(deal_id, "documents", f"{e['doc_id']}.pdf") if meta else None
+            loc = docs.locate(pdf, e["page"], e["excerpt"], meta["page_count"] if meta else None)
+            entry.update({"text_after": new_text, "status_after": "Pending", "location_status": loc["status"]})
+            repo.append_audit(deal_id, entry)
+            e.update({"statement": new_text, "status": "Pending", "note": None, "location_status": loc["status"], "rects": loc["rects"],
+                      "located_page": loc["located_page"], "page_offset": loc.get("page_offset", 0),
+                      "issues": [loc["issue"]] if loc["issue"] else [], "review_flag": loc["status"] != "Located"})
+        else:
+            raise AppError(422, "bad_action", "Unknown action (use approve, flag or edit).")
+        repo.write(deal_id, "evidence.json", evidence)
+    return {"evidence_id": ev_id, "status": e["status"], "statement": e["statement"], "location_status": e["location_status"],
+            "issues": e["issues"], "note": e.get("note"), "original_statement": e.get("original_statement", e["statement"])}
+
+
+def s2_bulk(repo: Repo, deal_id: str, action: str, analyst: str | None) -> dict:
+    """Bulk-approve every Pending Section 2 evidence item; one audit entry per item (same record as a click)."""
+    name = valid_name(analyst)
+    if action != "approve_pending":
+        raise AppError(422, "bad_action", "Unknown bulk action.")
+    with deal_lock(deal_id):
+        deal = repo.get_deal(deal_id)
+        evidence = repo.read(deal_id, "evidence.json", {})
+        changed = 0
+        for ev_id, e in evidence.items():
+            if e.get("type") == "document" and e.get("status", "Pending") == "Pending":
+                repo.append_audit(deal_id, {"type": "s2_review", "evidence_id": ev_id, "scope": e["scope"], "field": e["field"],
+                                            "action": "approve (bulk: approve_pending)", "analyst_name": name,
+                                            "status_before": "Pending", "status_after": "Approved", "text_before": e["statement"]})
+                e["status"], e["note"] = "Approved", None
+                changed += 1
+        if changed:
+            repo.write(deal_id, "evidence.json", evidence)
+    return {"changed": changed}
+
+
 # --------------------------------------------------------------------------- Section 3
 def s3_action(repo: Repo, deal_id: str, sid: str, action: str, analyst: str | None, text: str | None = None) -> dict:
     name = valid_name(analyst)
@@ -165,6 +228,31 @@ def memo_action(repo: Repo, deal_id: str, sid: str, action: str, analyst: str | 
         return st
 
 
+def memo_bulk(repo: Repo, deal_id: str, action: str, analyst: str | None) -> dict:
+    """Bulk-approve every Pending memo statement; one audit entry per statement (same record as a click)."""
+    name = valid_name(analyst)
+    if action != "approve_pending":
+        raise AppError(422, "bad_action", "Unknown bulk action.")
+    with deal_lock(deal_id):
+        deal = repo.get_deal(deal_id)
+        s5 = repo.read(deal_id, "s5.json")
+        if not s5:
+            raise AppError(409, "precondition", "Generate the memo first.")
+        ctx = load_context(repo, deal)
+        changed = 0
+        for st in s5["statements"]:
+            if st["status"] == "Pending":
+                repo.append_audit(deal_id, {"type": "memo_review", "statement_id": st["id"], "action": "approve (bulk: approve_pending)",
+                                            "analyst_name": name, "status_before": "Pending", "status_after": "Approved",
+                                            "text_before": st["text"], "text_after": st["text"], "correction": "",
+                                            "refs": st["refs"], "evidence_snapshot": evidence_snapshot(ctx, st["refs"])})
+                st.update({"status": "Approved", "note": None})
+                changed += 1
+        if changed:
+            repo.write(deal_id, "s5.json", s5)
+    return {"changed": changed, "s5": s5}
+
+
 def evidence_lookup(repo: Repo, deal_id: str, ev_id: str, statement_id: str | None) -> dict:
     deal = repo.get_deal(deal_id)
     ctx = load_context(repo, deal)
@@ -188,8 +276,12 @@ def evidence_lookup(repo: Repo, deal_id: str, ev_id: str, statement_id: str | No
         _flag_on_activation(repo, deal_id, statement_id, ev_id, "Source document unavailable", always=True)
         return result
     loc = docs.locate(pdf, e["page"], e["excerpt"], meta["page_count"])
-    png = docs.render_page_png(pdf, e["page"], loc["rects"])
-    result.update({"location_status": loc["status"], "image": "data:image/png;base64," + base64.b64encode(png).decode("ascii")})
+    # Render the physical page where the passage was actually found (may differ from the cited page
+    # when the document has unnumbered front matter), so highlights align with the rendered image.
+    render_page = loc["located_page"] or e["page"]
+    png = docs.render_page_png(pdf, render_page, loc["rects"])
+    result.update({"location_status": loc["status"], "image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+                   "located_page": loc["located_page"], "page_offset": loc.get("page_offset", 0)})
     if loc["status"] != "Located":
         _flag_on_activation(repo, deal_id, statement_id, ev_id, "Source passage not located")
     else:

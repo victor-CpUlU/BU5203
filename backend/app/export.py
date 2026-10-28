@@ -68,7 +68,8 @@ class CiteLedger:
             n = self.num[r]
             if r in self.ctx["evidence"]:
                 e = self.ctx["evidence"][r]
-                desc = f"{e['doc_name']}, page {e['page']}"
+                lp = e.get("located_page")
+                desc = f"{e['doc_name']}, page {e['page']}" + (f" (found on physical page {lp})" if lp and lp != e["page"] else "")
                 if e.get("section_heading"):
                     desc += f" ({e['section_heading']})"
                 if e.get("excerpt"):
@@ -261,13 +262,15 @@ def audit_pdf(repo: Repo, deal_id: str) -> Path:
                 ["Last status change", f"{last['analyst_name']} at {last['timestamp']}" if last else "None"]]
         for a in audit:
             if a.get("statement_id") == s["id"] and a.get("action") == "correct":
-                rows.append(["Correction", f"{a['analyst_name']} at {a['timestamp']}: \"{a['text_before']}\" -> \"{a['text_after']}\""])
+                rows.append(["Edit", f"{a['analyst_name']} at {a['timestamp']}: \"{a['text_before']}\" -> \"{a['text_after']}\""])
         if not s["refs"]:
             rows.append(["Evidence", "No supporting reference"])
         for r in s["refs"]:
             if r in ctx["evidence"]:
                 e = ctx["evidence"][r]
-                rows.append([r, f"{e['doc_id']} {e['doc_name']}, page {e['page']} ({e['location_status']}): \"{e['excerpt']}\""])
+                lp = e.get("located_page")
+                page_desc = f"page {e['page']}" + (f" (found on physical page {lp})" if lp and lp != e["page"] else "")
+                rows.append([r, f"{e['doc_id']} {e['doc_name']}, {page_desc} ({e['location_status']}): \"{e['excerpt']}\""])
             elif r in ctx["csv"]:
                 e = ctx["csv"][r]
                 rows.append([r, f"{e['file_name']}: {e['metric_label_as_written']}, {e['column_header']} = {e['display']}"
