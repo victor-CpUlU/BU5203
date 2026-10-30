@@ -111,6 +111,11 @@ def verify_statement(stmt: dict, ctx: dict, mode: str = "S3") -> dict:
                 if e.get("unit") == "days":
                     exact.add((f["number"], "days"))
                     exact.add((f["number"], None))
+        if e and e.get("basis"):
+            # The workbook's basis note for the cited metric (e.g. "Receivables / revenue x 91 days") is database
+            # text shown with the CSV- source, so a figure quoted from it is traceable.
+            for f in extract_figures(e["basis"]):
+                exact.add((f["number"], f["unit"]))
         ev = ctx.get("evidence", {}).get(r)
         if ev:
             for f in extract_figures(ev.get("excerpt", "")):

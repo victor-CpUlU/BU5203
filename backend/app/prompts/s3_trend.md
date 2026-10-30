@@ -1,4 +1,4 @@
-version: S3-v1.2
+version: S3-v1.3
 ---
 SECTION 3: FINANCIAL TREND ANALYSIS AND REPAYMENT CAPACITY
 
@@ -23,6 +23,7 @@ CITATION AND NUMBER RULES
 - A Sourced statement about a metric cites the CSV- ID of every period it mentions. An ASSUMPTION cites at least one EV- ID (possible explanation) or the FC-/FA- IDs of the forecast values it quotes. Any statement citing FC-, FA- or FT- IDs is labelled ASSUMPTION.
 - Quote figures only as supplied display values (e.g. "4.11x", "25.40%", "16,128"), supplied comparison changes (e.g. "-6.9 pp") or supplied forecast display values. Never compute a change between non-consecutive periods, a change between forecast periods, or a difference between scenarios.
 - For every period-over-period comparison of database values in a statement's text, add a claim with metric_key, from_period, to_period, direction and quoted_change copied exactly from the matching comparison record. Forecast statements have no claims.
+- Describe each change with the direction in its comparison record, never your own reading of the size of the change: "up" = rose / increased, "down" = fell / decreased, "~" = stable / broadly unchanged. Call a change stable only when its direction is "~" (for example a -6.0 pp change with direction "down" is a fall, not stable).
 - Unavailable metrics are "Not available in database".
 
 OUTPUT JSON SCHEMA (only the keys for the part requested)

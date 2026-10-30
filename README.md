@@ -229,7 +229,7 @@ The dashboard shows five panels: **Profitability, Leverage, Liquidity, Cash Flow
 
 - **Charts** use the database values exactly. A triangle marker means the value is flagged. Each panel has a **data table** (click to expand) and lists any metrics that are **not available in database**. Hover a metric name to see how the workbook defines it for this company (for example, DSCR is a proxy for some companies).
 - Click **Run AI financial analysis**. It takes about a minute: the app sends 7 requests to the AI at the same time. The AI commentary appears beside each chart. Python then checks each statement and marks it:
-  - **Numbers verified**: every figure matches the cited data.
+  - **Numbers verified**: every figure matches the cited data. A figure from a cited metric's definition note, such as "91 days" for DSO, also counts.
   - **Number mismatch**: something doesn't match. The unmatched values are listed.
 - The **Divergence patterns** table shows the five patterns from the Project Details and, for each, the quarters where Python observed it (for example Revenue up while Operating Cash Flow fell).
 
