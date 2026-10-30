@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from . import documents as docs
 from . import export, lifecycle, review, sections
 from . import forecast as fcast
-from .financial import LoadError, build_dashboard, load_database
+from .financial import LoadError, build_dashboard, load_database, load_peers
 from .settings import get_settings
 from .storage import AppError, Repo, deal_lock, now_iso
 
@@ -305,6 +305,19 @@ def dashboard(deal_id: str):
     return build_dashboard(ds)
 
 
+@router.get("/deals/{deal_id}/peers")
+def peers(deal_id: str):
+    """All companies in the financial database, aligned by calendar quarter, for the Section 3 peer comparison."""
+    r, s = repo(), get_settings()
+    deal = r.get_deal(deal_id)
+    try:
+        data = load_peers(s.financial_db_path, s.large_swing, s.stable_band)
+    except LoadError as exc:
+        raise AppError(409, "peers_unavailable", str(exc)) from exc
+    ds = r.read(deal_id, "financial/dataset.json") or {}
+    return {**data, "borrower_sheet": ds.get("sheet"), "borrower": deal["intake"]["DI-BORROWER"]["display"]}
+
+
 def _mark_stale_from_s3(deal: dict, reason: str) -> None:
     before = {k: deal["sections"][k]["status"] for k in ("s3", "s4", "s5")}
     Repo.mark_later_stale(deal, "s2a")  # Section 3 onward
@@ -376,14 +389,17 @@ def save_forecast(deal_id: str, req: ForecastRequest):
     if not fc["available"]:
         raise AppError(409, "forecast_unavailable", fc["message"])
     clean = fc["assumptions"]
+    in_effect = _forecast_or_422(r, deal, None)["assumptions"]  # what Sections 3-5 currently use
+    unchanged = clean == in_effect
     changed = [f"{s}.{p}" for s, v in fc["sources"].items() for p, src in v.items() if src == "Set by the analyst"]
     with deal_lock(deal_id):
         r.append_audit(deal_id, {"type": "forecast_assumptions_saved", "analyst_name": name, "assumptions": clean,
-                                 "changed_from_defaults": changed})
+                                 "changed_from_defaults": changed, "changed_from_previous": not unchanged})
         r.write(deal_id, "forecast/assumptions.json", {**clean, "saved_by": name, "saved_at": now_iso()})
-        deal = r.get_deal(deal_id)
-        _mark_stale_from_s3(deal, "the forecast assumptions changed")
-        r.save_deal(deal)
+        if not unchanged:  # saving the same values (e.g. confirming the defaults) leaves the analysis up to date
+            deal = r.get_deal(deal_id)
+            _mark_stale_from_s3(deal, "the forecast assumptions changed")
+            r.save_deal(deal)
     return _forecast_view(_forecast_or_422(r, r.get_deal(deal_id), None))
 
 
@@ -440,7 +456,12 @@ def run_s3(deal_id: str, request: Request):
 
 @router.get("/deals/{deal_id}/section3")
 def get_s3(deal_id: str):
-    return repo().read(deal_id, "s3.json") or {}
+    s3 = repo().read(deal_id, "s3.json") or {}
+    if s3.get("statements"):
+        pos = sections.s3_positions(s3["statements"])
+        for st in s3["statements"]:
+            st["position"] = pos[st["id"]]["position"]
+    return s3
 
 
 @router.post("/deals/{deal_id}/section3/statements/{sid}/action")
@@ -493,7 +514,9 @@ def get_s5(deal_id: str):
     s5 = r.read(deal_id, "s5.json") or {}
     if s5:
         support = r.read(deal_id, "s6_support.json", {})
+        pos = sections.memo_positions(s5["statements"])
         for st in s5["statements"]:
+            st["position"], st["position_path"] = pos[st["id"]]["position"], pos[st["id"]]["path"]
             a = support.get(st["id"])
             st["support"] = a if a and a.get("text_at_check") == st["text"] else None
     return s5

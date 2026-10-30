@@ -492,10 +492,12 @@ def load_workbook(path: Path, borrower: str, thresholds: dict, stable_band: dict
             raise LoadError(f"Period column {head} on sheet {sheet} has no period end date in row 5.")
         end = excel_date(end_raw)
         cal = wb.text(sheet, f"{letter}6").strip()
+        rel_raw = wb.value(sheet, f"{letter}7")
+        released = excel_date(rel_raw).isoformat() if isinstance(rel_raw, float) else None
         label = f"Q{m.group(1)}-FY{m.group(2)}"
         if label in [p["label"] for p in periods]:
             raise LoadError(f"Duplicate period column: \"{head}\" on sheet {sheet}")
-        periods.append({"label": label, "end_date": end.isoformat(), "calendar_quarter": cal,
+        periods.append({"label": label, "end_date": end.isoformat(), "calendar_quarter": cal, "release_date": released,
                         "header": f"{head} (period end {end.isoformat()}{'; ' + cal if cal else ''})"})
         cols.append(letter)
         col += 1
@@ -616,3 +618,58 @@ def build_dashboard(dataset: dict) -> dict:
         panels.append({"key": pkey, "title": title, "metrics": metrics, "not_available": not_avail})
     return {"periods": labels, "panels": panels, "file_name": dataset["file_name"], "company": dataset.get("company"),
             "currency_unit": dataset.get("currency_unit"), "calculation_note": dataset.get("calculation_note")}
+
+
+# --------------------------------------------------------------------------- peer comparison
+_PEER_CACHE: dict[tuple, dict] = {}
+CAL_RE = re.compile(r"CQ([1-4])\s+(\d{4})")
+
+
+def _calendar_label(period: dict) -> str:
+    """The workbook's calendar-quarter date range, e.g. "CQ2 2026 (Apr–Jun)", used to line up fiscal calendars."""
+    cal = (period.get("calendar_quarter") or "").strip()
+    return cal if CAL_RE.search(cal) else period["label"]
+
+
+def _calendar_sort(label: str) -> tuple:
+    m = CAL_RE.search(label)
+    return (int(m.group(2)), int(m.group(1))) if m else (9999, 9)
+
+
+def load_peers(path: Path, thresholds: dict, stable_band: dict) -> dict:
+    """Every company in the workbook, aligned by calendar quarter, for the Section 3 peer comparison.
+
+    Values are the same database values the deal uses (no new calculation). Cached until the file changes."""
+    path = Path(path)
+    if path.suffix.lower() not in (".xlsx", ".xlsm") or not path.exists():
+        raise LoadError("The peer comparison needs the semiconductor workbook as the financial database.")
+    key = (str(path), path.stat().st_mtime_ns)
+    if key in _PEER_CACHE:
+        return _PEER_CACHE[key]
+    try:
+        wb = Workbook(path)
+    except WorkbookError as exc:
+        raise LoadError(str(exc)) from exc
+    companies, quarters = [], set()
+    for sh in company_sheets(wb):
+        ds = load_workbook(path, sh["sheet"], thresholds, stable_band)["dataset"]
+        cal = {p["label"]: _calendar_label(p) for p in ds["periods"]}
+        quarters.update(cal.values())
+        companies.append({
+            "sheet": ds["sheet"], "company": ds["company"], "currency_unit": ds["currency_unit"],
+            "periods": [{"fiscal": p["label"], "calendar": cal[p["label"]], "end_date": p["end_date"], "release_date": p.get("release_date")}
+                        for p in ds["periods"]],
+            "metrics": {m["key"]: {"label": m["label"], "unit": m["unit_type"], "unit_label": m.get("unit_label"), "basis": m.get("basis"),
+                                   "points": {cal[e["period"]]: {"fiscal": e["period"], "value": None if e["value"] is None else float(e["value"]),
+                                                                 "display": e["display"], "flags": e["flags"], "cell": e.get("cell"),
+                                                                 "evidence_id": e["evidence_id"],
+                                                                 "release_date": next((p.get("release_date") for p in ds["periods"] if p["label"] == e["period"]), None)}
+                                              for e in m["entries"]}}
+                        for m in ds["metrics"] if m["recognised"]},
+        })
+    order = sorted(quarters, key=_calendar_sort)
+    panels = [{"key": k, "title": t, "metrics": [{"key": mk, "label": CANONICAL_LABEL[mk]} for mk in mks]} for k, t, mks, _ in PANELS]
+    out = {"file_name": path.name, "quarters": order, "companies": companies, "panels": panels}
+    _PEER_CACHE.clear()
+    _PEER_CACHE[key] = out
+    return out

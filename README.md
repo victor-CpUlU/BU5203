@@ -233,7 +233,18 @@ The dashboard shows five panels: **Profitability, Leverage, Liquidity, Cash Flow
   - **Number mismatch**: something doesn't match. The unmatched values are listed.
 - The **Divergence patterns** table shows the five patterns from the Project Details and, for each, the quarters where Python observed it (for example Revenue up while Operating Cash Flow fell).
 
-**Forecast and scenario analysis.** Below the panels, Python projects the borrower's quarters forward under a **base, upside and downside case**. Set this up before running the AI analysis, because the AI commentary and the memo use it.
+**Peer comparison.** Below the panels, you can compare the borrower with the other companies in the database (AMD, Intel, Micron, NVIDIA, TSMC).
+- **Choosing what to show:** a grid lists every metric (rows) against every company (columns). Tick any combination, for example Revenue for Intel, AMD and NVIDIA but EBITDA for Intel only.
+  - Click a metric name to toggle that row.
+  - Use **All / none** under a company to toggle its column.
+  - The buttons **Key ratios, all companies**, **Borrower only** and **Clear all** give quick starting points.
+  - Your choice is remembered in the browser for each deal.
+- **Charts:** one chart per ticked metric, with one line per ticked company. The borrower's line is thicker, and a triangle marks a flagged value. Each chart has a data table, and a note on how each company defines the metric.
+- **Lining up quarters:** the companies have different fiscal years, so quarters are matched by the calendar date range each fiscal quarter falls in, as stated in the workbook. For example, NVIDIA Q2-FY2027 and Intel Q2-FY2026 are both "CQ2 2026 (Apr–Jun)". Hover a point to see its fiscal quarter and report date.
+- **Units:** amounts stay in each company's own unit, shown in the legend, such as "TSMC (NT$ bn)" or "Intel (USD m)". Ratios and percentages are directly comparable.
+- **Source:** the values are the database's own, read from the workbook file; nothing is calculated. The AI does not see this comparison, and it is not part of the memo.
+
+**Forecast and scenario analysis.** Below the peer comparison, Python projects the borrower's quarters forward under a **base, upside and downside case**. Set this up before running the AI analysis, because the AI commentary and the memo use it.
 - **Assumptions:** revenue growth per quarter, EBITDA margin, capex as % of revenue, change in interest on existing debt, and the interest rate on the requested facility. Base-case defaults are the averages of the database quarters; upside and downside add illustrative shocks. Each assumption shows its historical reference and where its value came from. Change any value; the results update as you type.
 - **Requested facility:** the amount comes from the deal intake. Set the repayment (bullet or equal quarterly instalments), tenor and forecast horizon. If the loan currency differs from the database (TSMC is in NT$ bn), enter an exchange rate.
 - **Thresholds (optional):** enter a minimum DSCR, minimum interest coverage, maximum Debt/EBITDA or minimum cash. Quarters that breach them are highlighted in red; nothing is marked pass or fail.
@@ -296,7 +307,12 @@ Regenerating the memo replaces it and resets all Section 6 reviews.
 3. Use **Approve**, **Flag** (with an optional note) or **Correct**. A corrected statement goes back to **Pending** until you approve it again.
 4. Use the filter buttons (All / Pending / Approved / Flagged) to find what still needs review. Statements based only on database values that you already approved in Section 3 start as Approved.
 5. **Download final Credit Memo PDF.** This works only when no statement is Pending. Flagged statements are kept in the PDF and marked **FLAGGED**, and every statement keeps its source citations.
-6. **Download Audit Trail PDF.** This lists every statement with its sources, supporting text or CSV values, status, corrections and who made them, plus the Section 3 review. You can download it at any time after the memo exists.
+6. **Download Audit Trail PDF.** This lists the forecast assumptions, every Section 3 statement and every memo statement. For each statement it shows:
+   - its position (for example "Section 1.3, statement 1 (M3)", meaning memo Section 1 Executive Summary, subsection 3 Key strengths and risks, first statement);
+   - its text, AI original, label, status and number check;
+   - whether the AI or the backend wrote it;
+   - every review action in time order: who, when, the status change and any note or text change;
+   - its sources. You can download it at any time after the memo exists.
 
 **Optional AI support check.** Set `SUPPORT_CHECK_ENABLED=true` in `.env` to show a **Run AI support check** button. It gives an advisory "Supported / Partially supported / Not supported" rating for each statement and never changes a status.
 

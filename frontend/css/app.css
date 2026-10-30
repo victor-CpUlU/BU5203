@@ -230,3 +230,13 @@ details summary { cursor: pointer; font-weight: 600; color: var(--navy); }
 td.breach { background: var(--bad-bg) !important; color: var(--bad); font-weight: 700; }
 .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: middle; }
 .fc-breaches { margin: 8px 0; }
+.stmt .meta .pos { font-weight: 700; color: var(--navy); font-size: .82rem; }
+/* ---- Section 3 peer comparison ---- */
+.peer-matrix th, .peer-matrix td { padding: 5px 9px; font-size: .84rem; vertical-align: middle; }
+.peer-matrix .peer-col { text-align: center; min-width: 92px; }
+.peer-matrix .peer-col button { margin-top: 4px; }
+.peer-matrix .peer-cell { text-align: center; }
+.peer-matrix .peer-cell input { width: 17px; height: 17px; cursor: pointer; accent-color: var(--navy); }
+.peer-matrix tr.peer-group th { background: #f0f3f7; color: var(--muted); font-size: .74rem; letter-spacing: .06em; text-transform: uppercase; }
+.peer-matrix button.link { text-align: left; font-weight: 600; text-decoration: none; color: var(--ink); }
+.peer-matrix button.link:hover { text-decoration: underline; }

@@ -48,6 +48,48 @@ def load_context(repo: Repo, deal: dict) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- readable statement positions
+S3_GROUP_TITLE = {"cross": "Relationships between metrics", "forecast": "Forecast and scenario analysis"}
+
+
+def memo_positions(statements: list[dict]) -> dict[str, dict]:
+    """Readable position of each memo statement, e.g. M3 -> "Section 1.3, statement 1"
+    (Executive Summary > Key strengths and risks). M-numbers stay the stable IDs."""
+    sub_index = {(n, k): i for n, _, subs in MEMO_OUTLINE for i, (k, _) in enumerate(subs, start=1)}
+    titles = {(n, k): (t, st) for n, t, subs in MEMO_OUTLINE for k, st in subs}
+    count: dict[tuple, int] = {}
+    out = {}
+    for s in statements:
+        key = (s["section"], s["subsection"])
+        count[key] = count.get(key, 0) + 1
+        i = sub_index.get(key, 0)
+        sec_title, sub_title = titles.get(key, (s.get("section_title", ""), s.get("subsection_title", "")))
+        ref = f"{s['section']}.{i}.{count[key]}"
+        out[s["id"]] = {"ref": ref, "position": f"Section {s['section']}.{i}, statement {count[key]}",
+                        "path": f"{s['section']}. {sec_title} > {sub_title}",
+                        "full": f"Section {s['section']}.{i}, statement {count[key]} ({s['section']}. {sec_title} > {sub_title})"}
+    return out
+
+
+def s3_positions(statements: list[dict]) -> dict[str, dict]:
+    """Readable position of each Section 3 statement, e.g. S3-12 -> "Section 3, Leverage panel, statement 2"."""
+    panel_title = {k: t for k, t, _, _ in PANELS}
+    count: dict[str, int] = {}
+    out = {}
+    for s in statements:
+        g = s["group"]
+        count[g] = count.get(g, 0) + 1
+        if g.startswith("panel:"):
+            where = f"{panel_title.get(g[6:], g[6:])} panel"
+        elif g.startswith("repayment:"):
+            _, dim, kind = g.split(":")
+            where = f"Repayment capacity, {dim.replace('_', ' ')}, {'supports' if kind == 'supports' else 'weakens'} repayment"
+        else:
+            where = S3_GROUP_TITLE.get(g, g)
+        out[s["id"]] = {"position": f"Section 3, {where}, statement {count[g]}", "full": f"Section 3, {where}, statement {count[g]}"}
+    return out
+
+
 FORECAST_PREFIXES = ("FC-", "FA-", "FT-")
 
 
@@ -93,9 +135,13 @@ def _divergence_payload(dataset: dict) -> list[dict]:
     return out
 
 
+DIRECTION_WORD = {"up": "rose", "down": "fell", "~": "stable"}
+
+
 def _comparisons_payload(dataset: dict) -> list[dict]:
     return [{"metric_key": c["metric_key"], "from_period": c["from_period"], "to_period": c["to_period"],
-             "change": c["change_display"], "direction": c["direction"]} for c in dataset["comparisons"]]
+             "change": c["change_display"], "direction": c["direction"], "describe_as": DIRECTION_WORD[c["direction"]]}
+            for c in dataset["comparisons"]]
 
 
 def _unavailable_payload(dataset: dict) -> list[dict]:

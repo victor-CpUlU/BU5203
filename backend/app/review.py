@@ -4,7 +4,7 @@ from __future__ import annotations
 import base64
 
 from . import documents as docs
-from .sections import describe_forecast_ref, evidence_snapshot, load_context
+from .sections import describe_forecast_ref, evidence_snapshot, load_context, s3_positions
 from .storage import AppError, Repo, deal_lock, now_iso
 from .verification import verify_statement
 
@@ -165,11 +165,14 @@ def s3_bulk(repo: Repo, deal_id: str, action: str, analyst: str | None) -> dict:
 
 def approval_blockers(s3: dict) -> list[dict]:
     out = []
+    pos = s3_positions(s3["statements"])
     for s in s3["statements"]:
+        where = pos[s["id"]]["position"]
         if s["status"] == "Pending":
-            out.append({"statement_id": s["id"], "reason": "Still Pending: approve or flag it"})
+            out.append({"statement_id": s["id"], "position": where, "reason": "Still Pending: approve or flag it"})
         elif s["verification"]["mark"] == "Number mismatch" and s["status"] != "Flagged":
-            out.append({"statement_id": s["id"], "reason": "Number mismatch: correct it or flag it"})
+            out.append({"statement_id": s["id"], "position": where,
+                        "reason": "Number mismatch: correct it with Edit or flag it (approving does not clear a mismatch)"})
     return out
 
 

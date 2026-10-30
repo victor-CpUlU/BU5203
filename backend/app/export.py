@@ -14,7 +14,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from .schemas import MEMO_OUTLINE
-from .sections import describe_forecast_ref, load_context
+from .sections import describe_forecast_ref, load_context, memo_positions, s3_positions
 from .storage import AppError, Repo
 
 MEMO_HEADER = "AI-generated draft reviewed by the analyst. Not a credit decision."
@@ -259,23 +259,41 @@ def audit_pdf(repo: Repo, deal_id: str) -> Path:
     story.append(Paragraph("Section 3 financial analysis review", H2))
     approval = next((a for a in reversed(audit) if a.get("type") == "s3_approval"), None)
     story.append(Paragraph(escape(f"Approval: {approval['analyst_name']} at {approval['timestamp']}" if approval else "Approval: not recorded"), BODY))
+    story.append(Paragraph("Each statement is named by its position (e.g. \"Section 3, Leverage panel, statement 2\"); "
+                           "the short ID in brackets (S3-n) is the reference used in the audit entries.", CAPTION))
+    s3pos = s3_positions(s3["statements"])
     for s in s3["statements"]:
         mark = s["verification"]["mark"]
         if s["verification"]["unmatched"]:
             mark += " (" + "; ".join(f"{u['value']}: {u['reason']}" for u in s["verification"]["unmatched"]) + ")"
-        line = f"{s['id']} [{s['status']}] {s['text']} | {mark}"
+        hist = _history(audit, s["id"], ("s3_review",))
+        rows = [["Item", "Detail"],
+                ["Statement", f"{s3pos[s['id']]['position']} ({s['id']})"],
+                ["Text", s["text"]],
+                ["Label / status / number check", f"{s['label']} / {s['status']} / {mark}"],
+                ["Evidence", ", ".join(s["refs"]) or "No supporting reference"]]
         if s["text"] != s["original_text"]:
-            line += f" | Original text: {s['original_text']}"
-        story.append(Paragraph(escape(line), SMALL))
+            rows.append(["AI original text", s["original_text"]])
+        rows += [["Review", h] for h in hist] or [["Review", "No analyst action recorded"]]
+        story += [_table(rows, [42 * mm, 132 * mm]), Spacer(1, 4)]
     story.append(Paragraph("Memo statements", H2))
+    story.append(Paragraph("Each statement is named by its position in the memo: \"Section 1.3, statement 1\" is the first statement of "
+                           "subsection 3 (Key strengths and risks) of Section 1 (Executive Summary). The short ID in brackets (M-n, "
+                           "numbered through the whole memo) is the reference used in the audit entries.", CAPTION))
+    mpos = memo_positions(s5["statements"])
     for s in s5["statements"]:
-        last = next((a for a in reversed(audit) if a.get("statement_id") == s["id"] and a.get("type") in ("memo_review", "memo_status")), None)
-        rows = [["Item", "Detail"], ["Statement", f"{s['id']} (section {s['section']}): {s['text']}"],
+        p = mpos[s["id"]]
+        rows = [["Item", "Detail"],
+                ["Statement", f"{p['position']} ({s['id']})"],
+                ["Location in memo", p["path"]],
+                ["Text", s["text"]],
+                ["Written by", "Backend (from the database / forecast), not the AI" if s.get("source") == "backend" else "AI, checked by the backend"],
                 ["Label / status", f"{s['label']} / {'PENDING' if s['status'] == 'Pending' else s['status']}" + (f" ({s['note']})" if s.get("note") else "")],
-                ["Last status change", f"{last['analyst_name']} at {last['timestamp']}" if last else "None"]]
-        for a in audit:
-            if a.get("statement_id") == s["id"] and a.get("action") == "correct":
-                rows.append(["Edit", f"{a['analyst_name']} at {a['timestamp']}: \"{a['text_before']}\" -> \"{a['text_after']}\""])
+                ["Number check", s["verification"]["mark"] + (" (" + "; ".join(f"{u['value']}: {u['reason']}" for u in s["verification"]["unmatched"]) + ")"
+                                                              if s["verification"]["unmatched"] else "")]]
+        if s["text"] != s["original_text"]:
+            rows.append(["AI original text", s["original_text"]])
+        rows += [["Review", h] for h in _history(audit, s["id"], ("memo_review", "memo_status"))] or [["Review", "No status change recorded"]]
         if not s["refs"]:
             rows.append(["Evidence", "No supporting reference"])
         for r in s["refs"]:
@@ -286,7 +304,8 @@ def audit_pdf(repo: Repo, deal_id: str) -> Path:
                 rows.append([r, f"{e['doc_id']} {e['doc_name']}, {page_desc} ({e['location_status']}): \"{e['excerpt']}\""])
             elif r in ctx["csv"]:
                 e = ctx["csv"][r]
-                rows.append([r, f"{e['file_name']}: {e['metric_label_as_written']}, {e['column_header']} = {e['display']}"
+                rows.append([r, f"{e['file_name']}{', cell ' + e['cell'] if e.get('cell') else ''}: {e['metric_label_as_written']}, "
+                                f"{e['column_header']} = {e['display']}{' ' + e['unit_label'] if e.get('unit_label') else ''}"
                                 + (f" | flags: {', '.join(e['flags'])}" if e["flags"] else "")])
             elif r in ctx["intake"]:
                 rows.append([r, f"Deal intake: {ctx['intake'][r]['display']}"])
@@ -299,6 +318,27 @@ def audit_pdf(repo: Repo, deal_id: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     _build(path, story, f"Audit Trail - {borrower}")
     return path
+
+
+def _history(audit: list[dict], sid: str, types: tuple) -> list[str]:
+    """Every recorded action on one statement, oldest first: who, when, what, and the change it made."""
+    out = []
+    for a in audit:
+        if a.get("statement_id") != sid or a.get("type") not in types:
+            continue
+        who = a.get("analyst_name") or "System"
+        action = a.get("action") or ("set by the system" if a.get("type") == "memo_status" else a.get("type"))
+        line = f"{a['timestamp'][:19].replace('T', ' ')} | {who} | {action}"
+        if a.get("status_before") or a.get("status_after"):
+            line += f" | {a.get('status_before') or 'new'} -> {a.get('status_after') or a.get('status_before')}"
+        if a.get("note"):
+            line += f" | note: {a['note']}"
+        if a.get("comment"):
+            line += f" | comment: {a['comment']}"
+        if a.get("text_after") and a.get("text_before") and a["text_after"] != a["text_before"]:
+            line += f" | text changed from \"{a['text_before']}\" to \"{a['text_after']}\""
+        out.append(line)
+    return out
 
 
 def repo_now() -> str:

@@ -81,7 +81,7 @@ function errText(e) {
   let msg = e.message;
   const d = e.body.details;
   if (Array.isArray(d) && d.length) {
-    msg += "\n" + d.slice(0, 12).map((x) => "- " + (typeof x === "string" ? x : x.reason ? `${x.statement_id}: ${x.reason}` : JSON.stringify(x))).join("\n");
+    msg += "\n" + d.slice(0, 12).map((x) => "- " + (typeof x === "string" ? x : x.reason ? `${x.position ? `${x.position} (${x.statement_id})` : x.statement_id}: ${x.reason}` : JSON.stringify(x))).join("\n");
   }
   return msg;
 }
@@ -640,7 +640,8 @@ function dataTable(panel, periods) {
 
 function s3Statement(st, approved) {
   const box = h("div", { class: `stmt ${st.status}`, id: `st-${st.id}` });
-  const meta = h("div", { class: "meta" }, h("code", {}, st.id), tag(labelText(st.label), labelKind(st.label)),
+  const meta = h("div", { class: "meta" }, st.position ? h("span", { class: "pos" }, st.position) : null,
+    h("code", { title: "Short ID used in the audit trail" }, st.id), tag(labelText(st.label), labelKind(st.label)),
     tag(st.verification.mark, st.verification.mark === "Numbers verified" ? "ok" : "bad"), tag(st.status, statusKind(st.status)),
     st.refs.map((r) => evButton(r, null, sourceDialog)));
   box.append(h("div", {}, st.text), meta);
@@ -671,6 +672,137 @@ function s3Statement(st, approved) {
     h("button", { type: "button", class: "small secondary", onclick: () => editor("edit") }, "Edit"));
   box.append(actions);
   return box;
+}
+
+// --------------------------------------------------------------------------- Section 3: peer comparison
+const PEER_COLOURS = ["#0f2d4e", "#c79214", "#1e6b35", "#9c1c1c", "#6b4aa7", "#4a7aa7", "#9c6b1f"];
+const PEER_DEFAULT_METRICS = ["REVENUE_GROWTH", "EBITDA_MARGIN", "DEBT_EBITDA", "INTEREST_COVERAGE", "CURRENT_RATIO"];
+
+async function peerCard(deal) {
+  const card = h("section", { class: "card panel-card", "aria-labelledby": "peer-head" },
+    h("div", { class: "panel-head" }, h("h3", { id: "peer-head" }, "Peer comparison")));
+  const body = h("div", { class: "fc-body" });
+  card.append(body);
+  let data;
+  try { data = await api("GET", `/deals/${deal.deal_id}/peers`); }
+  catch (e) { body.append(h("p", { class: "tag warn" }, errText(e))); return card; }
+
+  // borrower first, then the peers in workbook order
+  const comps = [...data.companies].sort((a, b) => (b.sheet === data.borrower_sheet) - (a.sheet === data.borrower_sheet));
+  const colour = Object.fromEntries(comps.map((c, i) => [c.sheet, PEER_COLOURS[i % PEER_COLOURS.length]]));
+  const storeKey = `peers:${deal.deal_id}`;
+  let sel;
+  try { sel = JSON.parse(localStorage.getItem(storeKey)); } catch (e) { sel = null; }
+  if (!sel || typeof sel !== "object") {
+    sel = {};
+    PEER_DEFAULT_METRICS.forEach((m) => (sel[m] = comps.map((c) => c.sheet)));
+  }
+  const save = () => localStorage.setItem(storeKey, JSON.stringify(sel));
+  const isOn = (m, sheet) => (sel[m] || []).includes(sheet);
+  const setOn = (m, sheet, on) => {
+    const cur = new Set(sel[m] || []);
+    on ? cur.add(sheet) : cur.delete(sheet);
+    if (cur.size) sel[m] = [...cur]; else delete sel[m];
+  };
+
+  const charts = [];
+  const chartsBox = h("div", {});
+  const boxes = {};
+  const syncBoxes = () => Object.entries(boxes).forEach(([k, el]) => { const [m, s] = k.split("|"); el.checked = isOn(m, s); });
+  const changed = () => { save(); syncBoxes(); renderCharts(); };
+
+  // ---- selection matrix: metrics (rows) x companies (columns) ----
+  const has = (c, m) => c.metrics[m] && Object.values(c.metrics[m].points).some((p) => p.value !== null || p.display === "n/m");
+  const colBtn = (c) => h("button", { type: "button", class: "small secondary", title: `Show or hide every metric for ${c.company}`,
+    onclick: () => { const all = data.panels.flatMap((p) => p.metrics.map((m) => m.key)).filter((m) => has(c, m));
+      const on = !all.every((m) => isOn(m, c.sheet)); all.forEach((m) => setOn(m, c.sheet, on)); changed(); } }, "All / none");
+  const rowBtn = (m) => h("button", { type: "button", class: "link", title: "Show or hide this metric for every company",
+    onclick: () => { const avail = comps.filter((c) => has(c, m.key)); const on = !avail.every((c) => isOn(m.key, c.sheet));
+      avail.forEach((c) => setOn(m.key, c.sheet, on)); changed(); } }, m.label);
+  const matrix = h("table", { class: "peer-matrix" },
+    h("thead", {}, h("tr", {}, h("th", {}, "Metric (click a name to toggle the row)"),
+      comps.map((c) => h("th", { class: "peer-col" }, h("span", { class: "dot", style: `background:${colour[c.sheet]}` }), ` ${c.sheet}`,
+        c.sheet === data.borrower_sheet ? h("div", { class: "small muted" }, "Borrower") : null,
+        h("div", { class: "small muted" }, c.currency_unit || ""), colBtn(c))))),
+    h("tbody", {}, data.panels.flatMap((p) => [
+      h("tr", { class: "peer-group" }, h("th", { colspan: comps.length + 1 }, p.title)),
+      ...p.metrics.map((m) => h("tr", {}, h("th", { scope: "row" }, rowBtn(m)),
+        comps.map((c) => {
+          if (!has(c, m.key)) return h("td", { class: "peer-cell muted small", title: "Not in the database for this company" }, "n/a");
+          const cb = h("input", { type: "checkbox", "aria-label": `${m.label} for ${c.company}` });
+          cb.checked = isOn(m.key, c.sheet);
+          cb.addEventListener("change", () => { setOn(m.key, c.sheet, cb.checked); changed(); });
+          boxes[`${m.key}|${c.sheet}`] = cb;
+          return h("td", { class: "peer-cell" }, cb);
+        })))])));
+
+  const presets = h("div", { class: "row" },
+    h("button", { type: "button", class: "secondary small", onclick: () => { sel = {}; PEER_DEFAULT_METRICS.forEach((m) => (sel[m] = comps.map((c) => c.sheet))); changed(); } }, "Key ratios, all companies"),
+    h("button", { type: "button", class: "secondary small", onclick: () => { sel = {}; data.panels.forEach((p) => p.metrics.forEach((m) => { if (comps.some((c) => c.sheet === data.borrower_sheet && has(c, m.key))) sel[m.key] = [data.borrower_sheet]; })); changed(); } }, "Borrower only"),
+    h("button", { type: "button", class: "secondary small", onclick: () => { sel = {}; changed(); } }, "Clear all"));
+
+  // ---- charts: one per selected metric, one line per selected company ----
+  const renderCharts = () => {
+    charts.splice(0).forEach((c) => { c.destroy(); state.charts = state.charts.filter((x) => x !== c); });
+    const metricOrder = data.panels.flatMap((p) => p.metrics);
+    const chosen = metricOrder.filter((m) => (sel[m.key] || []).length);
+    if (!chosen.length) { chartsBox.replaceChildren(h("p", { class: "empty" }, "Tick at least one metric and company above to draw a chart.")); return; }
+    const grid = h("div", { class: "fc-grid" });
+    const tables = [];
+    for (const m of chosen) {
+      const list = comps.filter((c) => isOn(m.key, c.sheet) && has(c, m.key));
+      if (!list.length) continue;
+      const first = list[0].metrics[m.key];
+      const units = [...new Set(list.map((c) => (first.unit === "amount" ? c.metrics[m.key].unit_label || c.currency_unit : null)))].filter(Boolean);
+      const axis = first.unit === "amount" ? `Amount (${units.join(" / ")})` : UNIT_LABEL[first.unit] || first.unit;
+      const datasets = list.map((c) => {
+        const mm = c.metrics[m.key];
+        const pts = data.quarters.map((q) => mm.points[q] || null);
+        const unit = mm.unit === "amount" ? ` (${mm.unit_label || c.currency_unit})` : "";
+        const mine = c.sheet === data.borrower_sheet;
+        return { label: `${c.sheet}${unit}`, data: pts.map((p) => (p ? p.value : null)), pts,
+          borderColor: colour[c.sheet], backgroundColor: colour[c.sheet], borderWidth: mine ? 3.5 : 2, pointRadius: mine ? 4.5 : 3,
+          pointStyle: pts.map((p) => (p && p.flags.length ? "triangle" : "circle")), tension: .2, spanGaps: false };
+      });
+      const canvas = h("canvas", { role: "img", "aria-label": `${m.label}: ${list.map((c) => c.sheet).join(", ")}. Values are in the table below.` });
+      const chart = new Chart(canvas, {
+        type: "line", data: { labels: data.quarters, datasets },
+        options: { responsive: true, maintainAspectRatio: false, animation: false,
+          plugins: { legend: { position: "bottom", labels: { usePointStyle: true, boxWidth: 8, font: { size: 11 } } },
+            tooltip: { callbacks: { label: (ctx) => {
+              const p = ctx.dataset.pts[ctx.dataIndex];
+              if (!p) return `${ctx.dataset.label}: no data`;
+              return `${ctx.dataset.label}: ${p.display} (${p.fiscal}${p.release_date ? `, reported ${p.release_date}` : ""})${p.flags.length ? " \u26a0 " + p.flags.join(", ") : ""}`;
+            } } } },
+          scales: { x: { ticks: { font: { size: 10 }, maxRotation: 45 } }, y: { title: { display: true, text: axis, font: { size: 11 } }, grace: "8%" } } },
+      });
+      charts.push(chart); state.charts.push(chart);
+      const basisNotes = list.filter((c) => c.metrics[m.key].basis).map((c) => `${c.sheet}: ${c.metrics[m.key].basis}`);
+      grid.append(h("div", { class: "fc-chart" }, h("p", { class: "chart-unit" }, m.label), h("div", { class: "chart-box" }, canvas),
+        basisNotes.length ? h("details", { class: "small" }, h("summary", {}, "How each company defines it"), h("ul", {}, basisNotes.map((b) => h("li", {}, b)))) : null));
+      tables.push(h("details", { class: "data-table" }, h("summary", {}, `Data table: ${m.label}`),
+        h("div", { class: "table-wrap" }, h("table", {},
+          h("thead", {}, h("tr", {}, h("th", {}, "Calendar quarter"), list.map((c) => h("th", {}, c.sheet, first.unit === "amount" ? h("div", { class: "small muted" }, c.metrics[m.key].unit_label || c.currency_unit) : null)))),
+          h("tbody", {}, data.quarters.map((q) => h("tr", {}, h("th", { scope: "row" }, q), list.map((c) => {
+            const p = c.metrics[m.key].points[q];
+            return h("td", { title: p ? `${p.fiscal}${p.release_date ? `, reported ${p.release_date}` : ""}${p.cell ? `, cell ${p.cell}` : ""}` : null },
+              p ? p.display : "-", p ? h("div", { class: "small muted" }, p.fiscal) : null, p && p.flags.length ? h("div", {}, p.flags.map((f) => tag(f, "warn"))) : null);
+          }))))))));
+    }
+    chartsBox.replaceChildren(grid, ...tables);
+  };
+
+  body.append(
+    h("p", {}, "Compare the borrower with the other companies in the financial database. Tick any metric for any company; the charts update immediately. Values come straight from the database (", h("b", {}, data.file_name), "); the AI does not see or calculate this comparison."),
+    h("ul", { class: "small muted" },
+      h("li", {}, "Quarters are lined up by the calendar date range each fiscal quarter falls in, as stated in the workbook (e.g. NVIDIA Q2-FY2027 and Intel Q2-FY2026 are both CQ2 2026, Apr\u2013Jun). Hover a point to see its fiscal quarter and report date."),
+      h("li", {}, "Amounts are in each company's own unit, shown in the legend: USD m, or NT$ bn for TSMC. Ratios and percentages are directly comparable."),
+      h("li", {}, "Some ratios are defined differently by company (for example DSCR). Open \u201cHow each company defines it\u201d under a chart.")),
+    presets,
+    h("div", { class: "table-wrap", style: "margin-top:10px" }, matrix),
+    h("h4", {}, "Charts"), chartsBox);
+  renderCharts();
+  return card;
 }
 
 // --------------------------------------------------------------------------- Section 3: forecast and scenarios
@@ -993,6 +1125,7 @@ async function screenDashboard() {
         h("div", { class: "panel-commentary" }, h("h4", { class: "commentary-head" }, "AI commentary"),
           commentary.length ? commentary : h("p", { class: "muted small" }, "No AI commentary yet. Run the AI financial analysis above."))));
   });
+  const peerBox = await peerCard(deal);
   const fcCard = await forecastCard(deal, stmts.filter((s) => s.group === "forecast"));
 
   const extra = [];
@@ -1012,7 +1145,7 @@ async function screenDashboard() {
   }
   const emptyState = has ? null : h("div", { class: "empty" },
     "No AI analysis yet. Review the charts and the forecast assumptions below, then click \u201cRun AI financial analysis\u201d above to add the AI commentary.");
-  $main.replaceChildren(...[h("h2", {}, "Section 3: Financial trend dashboard and AI analysis"), top, emptyState, ...panels, fcCard, ...extra,
+  $main.replaceChildren(...[h("h2", {}, "Section 3: Financial trend dashboard and AI analysis"), top, emptyState, ...panels, peerBox, fcCard, ...extra,
     nextSection(deal.deal_id, "risks")].filter(Boolean));
 }
 
@@ -1054,7 +1187,8 @@ async function screenRisks() {
 function memoStatement(st, review, openSource) {
   const box = h("div", { class: `stmt ${st.status}${state.activeStatement === st.id ? " active" : ""}`, id: `m-${st.id}` });
   box.append(h("div", {}, st.text),
-    h("div", { class: "meta" }, h("code", {}, st.id), tag(labelText(st.label), labelKind(st.label)), tag(st.status, statusKind(st.status)),
+    h("div", { class: "meta" }, st.position ? h("span", { class: "pos", title: st.position_path || null }, st.position) : null,
+      h("code", { title: "Short ID used in the audit trail" }, st.id), tag(labelText(st.label), labelKind(st.label)), tag(st.status, statusKind(st.status)),
       tag(st.verification.mark, st.verification.mark === "Numbers verified" ? "ok" : "bad"),
       st.source === "backend" ? tag("Backend-generated", "muted") : null,
       st.refs.length ? st.refs.map((r) => evButton(r, st.id, openSource)) : h("span", { class: "muted" }, "No references")));
@@ -1231,7 +1365,8 @@ async function screenReview() {
     state.lastSource = evId;
     const fresh = await api("GET", `/deals/${deal.deal_id}/section5`);
     const after = fresh.statements.find((s) => s.id === sid)?.status;
-    if (before !== after) { toast(`${sid} was flagged automatically: the source could not be located.`); await rerender(); }
+    const where = s5.statements.find((s) => s.id === sid)?.position;
+    if (before !== after) { toast(`${where ? `${where} (${sid})` : sid} was flagged automatically: the source could not be located.`); await rerender(); }
   };
   if (state.lastSource) renderSource(sourcePanel, state.lastSource, null);
   const counts = { All: s5.statements.length, Pending: 0, Approved: 0, Flagged: 0 };
