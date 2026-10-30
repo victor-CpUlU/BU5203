@@ -22,9 +22,23 @@ def test_full_pipeline(env, fake_llm):
     # Section 2C: the external financial database is auto-connected at deal creation (no analyst action)
     assert deal["financial"]["status"] == "connected" and deal["financial"]["confirmed"] is True
     fin = c.get(f"/api/deals/{did}/financial").json()
-    assert "Database has no borrower identifier" in fin["information_gaps"]
-    assert len(fin["comparisons"]) == 30
+    assert fin["sheet"] == "Intel" and fin["company"] == "Intel Corporation"
+    assert len(fin["comparisons"]) == 72
     assert len(c.get(f"/api/deals/{did}/dashboard").json()["panels"]) == 5
+
+    # Forecast and scenarios: defaults from the database averages; analyst edits are validated, saved and audited
+    fc = c.get(f"/api/deals/{did}/forecast").json()
+    assert fc["available"] and fc["status"]["state"] == "default" and set(fc["scenarios"]) == {"base", "upside", "downside"}
+    assert fc["assumptions"]["facility"] == {"repayment": "bullet", "tenor_quarters": 20, "fx_rate": None}
+    assert fc["facility"]["value"] == 500.0  # 500000000 USD in USD m
+    assert fc["assumptions"]["scenarios"]["base"]["revenue_growth"] == fc["history_stats"]["revenue_growth"]["mean"]
+    bad_fc = c.post(f"/api/deals/{did}/forecast/preview", json={"assumptions": {"scenarios": {"base": {"ebitda_margin": 500}}}})
+    assert bad_fc.status_code == 422 and bad_fc.json()["fields"][0]["field"] == "base.ebitda_margin"
+    new = {**fc["assumptions"], "thresholds": {"min_dscr": 1.25}, "horizon_quarters": 8}
+    assert c.put(f"/api/deals/{did}/forecast", json={"assumptions": new, "analyst_name": ""}).status_code == 422
+    saved = c.put(f"/api/deals/{did}/forecast", json={"assumptions": new, "analyst_name": "Ana"}).json()
+    assert saved["status"]["state"] == "saved" and len(saved["periods"]) == 8 and saved["breaches"]
+    assert c.get(f"/api/deals/{did}/evidence/FT-MIN_DSCR").json()["display"] == "1.25x"
 
     # documents
     pdf = make_pdf(env / "intel.pdf", [
@@ -73,7 +87,9 @@ def test_full_pipeline(env, fake_llm):
     # Section 3: analysis, number checks, approval gate
     s3 = c.post(f"/api/deals/{did}/section3/run").json()
     assert s3["statements"] and all(s["verification"]["mark"] == "Numbers verified" for s in s3["statements"])
-    assert all(d["result"].startswith("Not assessable") for d in s3["divergences"])
+    assert not any(d["result"].startswith("Not assessable") for d in s3["divergences"])
+    assert [s["group"] for s in s3["statements"]].count("forecast") == 3
+    assert all(s["label"] == "ASSUMPTION" for s in s3["statements"] if s["group"] == "forecast")
     blocked = c.post(f"/api/deals/{did}/section3/approve", json={"analyst_name": "Ana"})
     assert blocked.status_code == 409 and blocked.json()["details"]
     assert c.post(f"/api/deals/{did}/section3/statements/S3-1/action", json={"action": "approve", "analyst_name": ""}).status_code == 422
@@ -104,7 +120,12 @@ def test_full_pipeline(env, fake_llm):
     sts = s5["statements"]
     assert [s["id"] for s in sts] == [f"M{i}" for i in range(1, len(sts) + 1)]
     assert {s["section"] for s in sts} == set(range(1, 8))
-    assert any("Pro-forma debt service" in s["text"] and s["label"] == "NOT VERIFIED" for s in sts)
+    # with a forecast, pro-forma debt service and the scenario summaries are backend-generated from FC- values
+    proforma = [s for s in sts if s["subsection"] == "dscr_and_debt_servicing" and "pro-forma debt service" in s["text"]]
+    assert proforma and proforma[0]["label"] == "ASSUMPTION" and proforma[0]["verification"]["mark"] == "Numbers verified"
+    scen = [s for s in sts if s["subsection"] == "forecast_and_scenarios"]
+    assert len(scen) >= 3 and all(s["source"] == "backend" and s["status"] == "Pending" for s in scen)
+    assert all(s["verification"]["mark"] == "Numbers verified" for s in scen)
     assert any(s["subsection"] == "conflicting_information" and "zero value" in s["text"] for s in sts)
     # A memo statement citing only EV- items approved in Section 2 carries over as "Approved in Section 2"
     carried = [s for s in sts if s.get("note") == "Approved in Section 2"]
@@ -117,8 +138,8 @@ def test_full_pipeline(env, fake_llm):
     business = next(s for s in sts if any(r.startswith("EV-") for r in s["refs"]))
     src = c.get(f"/api/deals/{did}/evidence/{business['refs'][0]}", params={"statement_id": business["id"]}).json()
     assert src["location_status"] == "Located" and src["image"].startswith("data:image/png;base64,")
-    csv_src = c.get(f"/api/deals/{did}/evidence/CSV-DSCR-Q1-2026").json()
-    assert csv_src["display"] == "0.00x" and "zero value" in csv_src["flags"]
+    csv_src = c.get(f"/api/deals/{did}/evidence/CSV-EBITDA_MARGIN-Q1-FY2026").json()
+    assert csv_src["display"] == "0.00%" and "zero value" in csv_src["flags"] and csv_src["cell"] == "Intel!D12"
     # Section 6 bulk approve: approves every Pending statement (name required); carried-over ones are already Approved
     assert c.post(f"/api/deals/{did}/memo/bulk", json={"action": "approve_pending", "analyst_name": ""}).status_code == 422
     pending_before = sum(1 for s in sts if s["status"] == "Pending")
@@ -165,9 +186,14 @@ def test_edit_and_delete_deal(env, fake_llm):
     assert body["financial"]["status"] == "connected"
 
     # changing the borrower re-connects the external database for the new name
-    rebranded = c.put(f"/api/deals/{did}", json={**INTAKE, "borrower": "Acme Semiconductors"}).json()
-    assert rebranded["intake"]["DI-BORROWER"]["display"] == "Acme Semiconductors"
+    rebranded = c.put(f"/api/deals/{did}", json={**INTAKE, "borrower": "Micron Technology"}).json()
+    assert rebranded["intake"]["DI-BORROWER"]["display"] == "Micron Technology"
     assert rebranded["financial"]["status"] == "connected"
+    assert c.get(f"/api/deals/{did}/financial").json()["sheet"] == "Micron"
+    # a borrower that is not in the database: connection error, and the earlier company's figures are removed
+    unknown = c.put(f"/api/deals/{did}", json={**INTAKE, "borrower": "Acme Semiconductors"}).json()
+    assert unknown["financial"]["status"] == "error" and "No company" in unknown["financial"]["error"]
+    assert c.get(f"/api/deals/{did}/financial").status_code == 404
 
     # validation still applies on edit
     bad = c.put(f"/api/deals/{did}", json={**INTAKE, "amount": "abc"})

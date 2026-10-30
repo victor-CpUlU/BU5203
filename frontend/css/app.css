@@ -215,3 +215,18 @@ details summary { cursor: pointer; font-weight: 600; color: var(--navy); }
 .memo-section { margin-bottom: 18px; }
 .memo-section h3 { border-bottom: 2px solid var(--gold); display: inline-block; padding-bottom: 4px; margin-bottom: 10px; }
 .memo-section h4 { margin: 14px 0 7px; color: var(--muted); text-transform: uppercase; font-size: .8rem; letter-spacing: .04em; }
+
+/* ---- Section 3 forecast and scenarios ---- */
+.fc-body { padding: 20px 22px; }
+.fc-body h4 { margin: 18px 0 8px; }
+.fc-table td, .fc-table th { vertical-align: top; }
+.fc-table .fc-input { width: 110px; }
+.fc-src { margin-top: 3px; max-width: 220px; }
+.fc-input[aria-invalid=true] { border-color: var(--bad); box-shadow: 0 0 0 3px rgba(156,28,28,.1); }
+.label-like { font-weight: 600; font-size: .9rem; }
+.fc-summary td, .fc-summary th { font-size: .86rem; }
+.fc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 8px 22px; margin-top: 14px; }
+.fc-detail th, .fc-detail td { white-space: nowrap; font-size: .8rem; padding: 6px 8px; }
+td.breach { background: var(--bad-bg) !important; color: var(--bad); font-weight: 700; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: middle; }
+.fc-breaches { margin: 8px 0; }

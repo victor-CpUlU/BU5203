@@ -13,7 +13,8 @@ EXCLUDE_PATTERNS = [
     r"\b\d{4}-\d{2}-\d{2}\b",
     r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
     r"\bEV-\d+\b",
-    r"\bCSV-[A-Z0-9_]+-Q[1-4]-\d{4}\b",
+    r"\bCSV-[A-Z0-9_]+-Q[1-4]-(?:FY)?\d{4}\b",
+    r"\bF[CAT]-[A-Z0-9_]+(?:-[A-Z0-9_]+)*\b",
     r"\bDI-[A-Z_]+\b",
     r"\bS3-\d+\b",
     r"\bM\d+\b",
@@ -31,15 +32,16 @@ UNIT_MAP = {"%": "%", "x": "x", "percent": "%", "times": "x", "pp": "pp", "perce
             "percentage points": "pp", "day": "days", "days": "days"}
 
 DIRECTION_WORDS = re.compile(r"\b(increas\w*|decreas\w*|rose|rise[sn]?|fell|fall\w*|up|down|improv\w*|deteriorat\w*|declin\w*|grew|grow\w*|higher|lower)\b", re.I)
+# Keyed by the names used in dataset["unavailable_metrics"] (canonical labels plus Project Details names).
 UNAVAILABLE_NAME_PATTERNS = {
     "Revenue": r"\brevenue(?!\s+growth)\b",
-    "EBITDA": r"(?<!debt/)(?<!debt / )\bebitda\b(?!\s+margin)",
+    "EBITDA": r"(?<!debt/)(?<!debt / )\bebitda\b(?!\s+(?:margin|\(ltm\)|excl))",
     "Net Profit Margin": r"\bnet profit margin\b",
     "Total Debt": r"\btotal debt\b",
     "Net Debt": r"\bnet debt\b",
-    "Debt / Equity": r"\bdebt\s?/\s?equity\b",
-    "Cash": r"(?<!operating )(?<!free )\bcash\b(?!\s+(?:flow|conversion|generation))",
-    "Short-term Debt": r"\bshort[- ]term debt\b",
+    "Debt/Equity": r"\bdebt\s?/\s?equity\b",
+    "Cash & Cash Equivalents": r"(?<!operating )(?<!free )\bcash\b(?!\s+(?:flow|conversion|generation))",
+    "Short-Term Debt": r"\bshort[- ]term debt\b",
     "Quick Ratio": r"\bquick ratio\b",
     "Capital Expenditure": r"\b(capital expenditure|capex)\b",
     "Free Cash Flow": r"\bfree cash flow\b",
@@ -113,6 +115,10 @@ def verify_statement(stmt: dict, ctx: dict, mode: str = "S3") -> dict:
         if ev:
             for f in extract_figures(ev.get("excerpt", "")):
                 exact.add((f["number"], f["unit"]))
+        fc = ctx.get("forecast", {}).get(r)
+        if fc:  # backend forecast value, forecast assumption or analyst threshold: quote its display exactly
+            for f in extract_figures(fc.get("display", "")):
+                exact.add((f["number"], f["unit"]))
         if mode in ("S4", "S5", "S6") and r in ctx.get("intake", {}):
             for f in extract_figures(str(ctx["intake"][r].get("display", ctx["intake"][r].get("value", "")))):
                 exact.add((f["number"], f["unit"]))
@@ -142,7 +148,10 @@ def verify_statement(stmt: dict, ctx: dict, mode: str = "S3") -> dict:
             unmatched.append({"value": label, "reason": "direction differs"})
             continue
         qc = (claim.get("quoted_change") or "").strip()
-        if qc:
+        if qc and match.get("change") is None:
+            if qc.lower() != (match.get("change_display") or "").lower():  # e.g. a change from zero is "Not computable"
+                unmatched.append({"value": qc, "reason": "change differs"})
+        elif qc:
             figs = extract_figures(qc)
             want = [(_abs(f["number"]), f["unit"]) for f in extract_figures(match["change_display"])]
             if not figs or (_abs(figs[0]["number"]), figs[0]["unit"]) not in want:

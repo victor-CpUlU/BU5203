@@ -15,6 +15,7 @@ const STEPS = [
   ["review", "6. Review & export"],
 ];
 const UNIT_LABEL = { percent: "Percent (%)", multiple: "Multiple (x)", days: "Days", amount: "Amount (unit not stated in database)" };
+const unitLabel = (unit, amountUnit) => (unit === "amount" && amountUnit ? `Amount (${amountUnit})` : UNIT_LABEL[unit] || unit);
 // Navy + gold led palette; later colours stay in the same cool/warm family so multi-line charts read as one set.
 const PALETTE = ["#0f2d4e", "#c79214", "#4a7aa7", "#9c6b1f", "#6b8f9c"];
 
@@ -365,23 +366,42 @@ async function screenIntake() {
 }
 
 // --------------------------------------------------------------------------- Section 2C: financial database display (auto-connected)
+function reconnectButton(deal) {
+  const b = h("button", { type: "button", class: "secondary" }, "Reconnect financial database");
+  b.addEventListener("click", async () => {
+    if (needName()) return;
+    if (!window.confirm("Re-read the financial database for this borrower?\n\nUse this after the workbook has been updated. Saved forecast assumptions are reset, and Sections 3-5 are marked out of date.")) return;
+    try {
+      const d = await busy(b, "Reconnecting...", () => api("POST", `/deals/${deal.deal_id}/financial/reconnect`, { analyst_name: analyst() }));
+      toast(d.financial.status === "connected" ? "Financial database reconnected." : `Could not connect: ${d.financial.error}`, d.financial.status === "connected");
+      await rerender();
+    } catch (e) { }
+  });
+  return b;
+}
+
 async function financialCard(deal) {
   const fin = deal.financial || {};
   if (fin.status === "error") {
     return h("div", { class: "card" }, h("h3", {}, "2C Financial data (external database)"),
       h("p", { class: "tag bad" }, `Could not connect to the financial database${fin.file_name ? ` (${fin.file_name})` : ""}: ${fin.error || "unknown error"}`),
-      h("p", { class: "small muted" }, "The connection is attempted automatically when the deal is created. Check the database file, then create the deal again."));
+      h("p", { class: "small muted" }, "The connection is attempted automatically when the deal is created or the borrower is changed. Check the borrower name (Edit deal) and the database file, then reconnect."),
+      reconnectButton(deal));
   }
   if (fin.status !== "connected" && fin.status !== "loaded") {
     return h("div", { class: "card" }, h("h3", {}, "2C Financial data (external database)"),
-      h("p", { class: "empty" }, "The financial database is not connected for this deal."));
+      h("p", { class: "empty" }, "The financial database is not connected for this deal."), reconnectButton(deal));
   }
   const ds = await api("GET", `/deals/${deal.deal_id}/financial`);
   return h("div", { class: "card" },
     h("h3", {}, "2C Financial data (external database)"),
     h("p", { class: "disclaimer" }, "These figures are fetched automatically from the external financial database (",
-      h("b", {}, fin.file_name || ds.file_name), "), connected via the system. Values are loaded with Python and Pandas exactly as stored; nothing is calculated or extracted by the AI."),
-    h("p", {}, `Periods (oldest to newest): ${ds.periods.map((p) => p.label).join(", ")}. Metrics: ${ds.metrics.length}.`),
+      h("b", {}, fin.file_name || ds.file_name), ds.sheet ? `, sheet \u201c${ds.sheet}\u201d` : "",
+      "), connected via the system. Values are the database's own figures and ratios, exactly as the workbook defines them; nothing is calculated or extracted by the AI."),
+    ds.company ? h("p", {}, `Company: ${ds.company}. Amounts in ${ds.currency_unit || "units not stated"}. Companies in the database: ${(ds.companies_in_database || []).join(", ")}.`) : null,
+    ds.calculation_note ? h("p", { class: "small muted" }, ds.calculation_note) : null,
+    h("p", {}, `Periods (oldest to newest): ${ds.periods.map((p) => p.label + (p.calendar_quarter ? ` (${p.calendar_quarter})` : "")).join(", ")}. Metrics: ${ds.metrics.length}.`),
+    h("div", { class: "row" }, reconnectButton(deal)),
     h("h4", {}, `Values flagged for review (${ds.flagged_values.length})`),
     ds.flagged_values.length ? h("table", {}, h("thead", {}, h("tr", {}, ["Evidence ID", "Metric", "Period", "Value", "Flags"].map((x) => h("th", {}, x)))),
       h("tbody", {}, ds.flagged_values.map((f) => h("tr", {}, h("td", {}, h("code", {}, f.evidence_id)), h("td", {}, f.metric), h("td", {}, f.period),
@@ -399,9 +419,22 @@ async function renderSource(container, evId, statementId) {
     const rows = [];
     const row = (k, v) => rows.push(h("tr", {}, h("th", { scope: "row" }, k), h("td", {}, v)));
     if (s.type === "csv") {
-      row("Evidence ID", s.evidence_id); row("Source", `Financial database: ${s.file_name}`); row("Metric (as in CSV)", s.metric_label);
-      row("Period column", s.column_header); row("Value", s.display); row("Anomaly flags", s.flags.join(", "));
+      row("Evidence ID", s.evidence_id); row("Source", `Financial database: ${s.file_name}${s.cell ? `, cell ${s.cell}` : ""}`); row("Metric (as in the database)", s.metric_label);
+      row("Period column", s.column_header); row("Value", s.display + (s.unit_label ? ` ${s.unit_label}` : ""));
+      if (s.formula) row("Workbook formula", h("code", {}, "=" + s.formula));
+      if (s.basis) row("Basis (company-specific)", s.basis);
+      row("Anomaly flags", s.flags.join(", "));
       container.replaceChildren(h("h3", {}, `Source for ${evId}`), h("table", {}, h("tbody", {}, rows)));
+    } else if (s.type === "forecast" || s.type === "forecast_assumption" || s.type === "forecast_threshold") {
+      row("Evidence ID", s.evidence_id);
+      row("Source", s.type === "forecast" ? "Backend forecast (Python), calculated from the database and the assumptions below"
+        : s.type === "forecast_threshold" ? "Threshold entered by the analyst" : "Forecast assumption");
+      row("Detail", s.description);
+      const st = s.assumptions_status || {};
+      row("Assumptions", st.state === "saved" ? `Saved by ${st.saved_by} at ${st.saved_at}` : "Database-average defaults (not saved by the analyst)");
+      if (s.assumptions) row("Scenario assumptions", h("ul", { style: "margin:0;padding-left:18px" }, s.assumptions.map((a) => h("li", {}, `${a.label}: ${a.display} (${a.source})`))));
+      container.replaceChildren(h("h3", {}, `Source for ${evId}`), h("p", { class: "disclaimer" }, "A forecast is a projection from stated assumptions, not a reported result."),
+        h("table", {}, h("tbody", {}, rows)));
     } else if (s.type === "deal_intake") {
       row("Evidence ID", s.evidence_id); row("Source", "Deal intake (entered by the analyst)"); row(s.label, s.value);
       container.replaceChildren(h("h3", {}, `Source for ${evId}`), h("table", {}, h("tbody", {}, rows)));
@@ -562,11 +595,13 @@ const pointLabels = {
 function panelCharts(panel, periods) {
   const wrap = h("div", {});
   const byUnit = {};
-  panel.metrics.forEach((m) => (byUnit[m.unit] = byUnit[m.unit] || []).push(m));
+  panel.metrics.forEach((m) => { const k = m.unit === "amount" ? `amount|${m.unit_label || ""}` : m.unit; (byUnit[k] = byUnit[k] || []).push(m); });
   let colour = 0;
-  for (const [unit, metrics] of Object.entries(byUnit)) {
+  for (const [unitKey, metrics] of Object.entries(byUnit)) {
+    const unit = unitKey.split("|")[0];
+    const axis = unitLabel(unit, metrics[0].unit_label);
     const canvas = h("canvas", { role: "img", "aria-label": `${panel.title} chart: ${metrics.map((m) => m.label).join(", ")}. Values are listed in the data table below.` });
-    wrap.append(h("p", { class: "chart-unit" }, UNIT_LABEL[unit] || unit), h("div", { class: "chart-box" }, canvas));
+    wrap.append(h("p", { class: "chart-unit" }, axis), h("div", { class: "chart-box" }, canvas));
     const datasets = metrics.map((m) => {
       const c = PALETTE[colour++ % PALETTE.length];
       return { label: m.label, data: m.series.map((p) => p.value), displays: m.series.map((p) => p.display), flags: m.series.map((p) => p.flags),
@@ -584,7 +619,7 @@ function panelCharts(panel, periods) {
             callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.dataset.displays[ctx.dataIndex]}${ctx.dataset.flags[ctx.dataIndex].length ? " (flags: " + ctx.dataset.flags[ctx.dataIndex].join(", ") + ")" : ""}` } } },
         scales: {
           x: { grid: { color: GRID, drawTicks: false }, border: { color: GRID }, ticks: { color: AXIS, font: { size: 11 } } },
-          y: { title: { display: true, text: UNIT_LABEL[unit] || unit, color: AXIS, font: { size: 11 } }, grace: "10%",
+          y: { title: { display: true, text: axis, color: AXIS, font: { size: 11 } }, grace: "10%",
                grid: { color: GRID, drawTicks: false }, border: { display: false }, ticks: { color: AXIS, font: { size: 11 } } } } },
       plugins: [pointLabels],
     }));
@@ -596,7 +631,7 @@ function dataTable(panel, periods) {
   if (!panel.metrics.length) return null;
   return h("details", { class: "data-table" }, h("summary", {}, `Data table: ${panel.title}`),
     h("table", {}, h("caption", { class: "small muted" }, "Values exactly as stored in the financial database, oldest to newest"),
-      h("thead", {}, h("tr", {}, h("th", {}, "Period"), panel.metrics.map((m) => h("th", {}, m.label)))),
+      h("thead", {}, h("tr", {}, h("th", {}, "Period"), panel.metrics.map((m) => h("th", { title: m.basis || null }, m.label, m.unit_label ? h("div", { class: "small muted" }, m.unit_label) : null)))),
       h("tbody", {}, periods.map((p, i) => h("tr", {}, h("th", { scope: "row" }, p), panel.metrics.map((m) => {
         const pt = m.series[i];
         return h("td", {}, pt ? pt.display : "Not available in database", pt && pt.flags.length ? h("div", {}, pt.flags.map((f) => tag(f, "warn"))) : null);
@@ -636,6 +671,241 @@ function s3Statement(st, approved) {
     h("button", { type: "button", class: "small secondary", onclick: () => editor("edit") }, "Edit"));
   box.append(actions);
   return box;
+}
+
+// --------------------------------------------------------------------------- Section 3: forecast and scenarios
+const SCEN = [["base", "Base"], ["upside", "Upside"], ["downside", "Downside"]];
+const SCEN_COLOUR = { base: "#c79214", upside: "#1e6b35", downside: "#9c1c1c" };
+const FC_CHARTS = [
+  ["REVENUE", "Revenue"], ["EBITDA", "EBITDA"], ["CFADS", "Cash flow available for debt service (EBITDA - capex)"],
+  ["DEBT_SERVICE", "Debt service (interest + principal)"], ["DSCR", "DSCR (cash flow available / debt service)"],
+  ["INTEREST_COVERAGE", "Interest coverage (EBITDA / interest)"], ["DEBT_EBITDA", "Debt/EBITDA (LTM)"], ["CASH", "Cash after debt service"],
+];
+const FC_TABLE = ["REVENUE", "EBITDA", "CAPEX", "CFADS", "INTEREST_EXPENSE", "PRINCIPAL", "DEBT_SERVICE", "DSCR", "INTEREST_COVERAGE",
+  "TOTAL_DEBT", "DEBT_EBITDA", "CASH", "FACILITY_BALANCE"];
+const THRESHOLD_FOR = { DSCR: "min_dscr", INTEREST_COVERAGE: "min_interest_coverage", DEBT_EBITDA: "max_debt_ebitda", CASH: "min_cash" };
+
+async function forecastCard(deal, aiStatements) {
+  let fc;
+  try { fc = await api("GET", `/deals/${deal.deal_id}/forecast`); }
+  catch (e) { return h("div", { class: "card" }, h("h3", {}, "Forecast and scenario analysis"), h("p", { class: "tag bad" }, errText(e))); }
+  const card = h("section", { class: "card panel-card", "aria-labelledby": "fc-head" },
+    h("div", { class: "panel-head" }, h("h3", { id: "fc-head" }, "Forecast and scenario analysis")));
+  const body = h("div", { class: "fc-body" });
+  card.append(body);
+  if (!fc.available) {
+    body.append(h("p", { class: "tag warn" }, fc.message));
+    return card;
+  }
+  const unit = fc.currency_unit || "";
+  const draft = JSON.parse(JSON.stringify(fc.assumptions));
+  const charts = [];
+  const statusLine = h("div", { class: "row" });
+  const fieldErr = h("div", { class: "err", "aria-live": "polite" });
+  const results = h("div", {});
+  let current = fc;
+  let dirty = false;
+
+  const setStatus = () => {
+    statusLine.replaceChildren(
+      dirty ? tag("Unsaved changes: preview only", "warn")
+        : fc.status.state === "saved" ? tag(`Saved by ${fc.status.saved_by} (${String(fc.status.saved_at).replace("T", " ").slice(0, 16)})`, "ok")
+          : tag("Defaults from the database averages (not yet saved)", "muted"));
+  };
+
+  const inputs = {};
+  const numInput = (path, value, { label, ...attrs } = {}) => {
+    const el = h("input", { type: "number", step: "any", value: value ?? "", "aria-label": label || path, class: "fc-input", ...attrs });
+    el.addEventListener("input", () => {
+      const v = el.value.trim();
+      const parts = path.split(".");
+      let o = draft;
+      for (const p of parts.slice(0, -1)) o = o[p];
+      o[parts.at(-1)] = v === "" ? null : Number(v);
+      dirty = true; setStatus(); schedule();
+    });
+    inputs[path] = el;
+    return el;
+  };
+
+  // ---- assumptions table ----
+  const stats = fc.history_stats;
+  const ref = (p) => {
+    const s = stats[p];
+    if (p === "facility_rate") return stats.implied_rate_existing_debt != null ? `Implied rate on existing debt: ${stats.implied_rate_existing_debt}% p.a. (latest quarterly interest x 4 / total debt)` : "Set by the analyst";
+    if (p === "interest_change") return "0% = latest quarter's interest expense held flat";
+    if (!s) return "No history";
+    return `Average ${s.mean}% (median ${s.median}%, range ${s.min}% to ${s.max}%, latest ${s.latest}%) over ${s.n} quarters, ${s.from_period} to ${s.to_period}`;
+  };
+  const srcLine = (s, p) => h("div", { class: "small muted fc-src", id: `src-${s}-${p}` }, (current.sources[s] || {})[p] || "");
+  const aTable = h("table", { class: "fc-table" },
+    h("caption", { class: "small muted" }, "Per-quarter assumptions in %. Upside and downside default to the base case plus illustrative shocks from config/analysis.toml; change any value."),
+    h("thead", {}, h("tr", {}, h("th", {}, "Assumption"), h("th", {}, "Historical reference"), SCEN.map(([, l]) => h("th", {}, `${l} case`)))),
+    h("tbody", {}, fc.params.map((p) => h("tr", {},
+      h("th", { scope: "row" }, p.label),
+      h("td", { class: "small" }, ref(p.key)),
+      SCEN.map(([s, l]) => h("td", {}, numInput(`scenarios.${s}.${p.key}`, draft.scenarios[s][p.key], { label: `${l} case: ${p.label}`, min: p.limits[0], max: p.limits[1] }), srcLine(s, p.key)))))));
+
+  // ---- facility, horizon, thresholds ----
+  const fac = fc.facility;
+  const rep = h("select", { "aria-label": "Facility repayment" },
+    h("option", { value: "bullet" }, "Bullet at the end of the tenor"), h("option", { value: "amortising" }, "Equal quarterly instalments"));
+  rep.value = draft.facility.repayment;
+  rep.addEventListener("change", () => { draft.facility.repayment = rep.value; dirty = true; setStatus(); schedule(); });
+  inputs["facility.repayment"] = rep;
+  const facAmount = h("b", {}, fac.value != null ? `${fac.value.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${unit}` : "Not included");
+  const facGrid = h("div", { class: "grid2" },
+    h("div", { class: "field" }, h("span", { class: "label-like" }, "Requested facility (from the deal intake)"),
+      h("div", {}, facAmount, h("span", { class: "small muted" }, ` = ${fac.deal_amount}`))),
+    h("div", { class: "field" }, h("label", {}, "Repayment"), rep),
+    h("div", { class: "field" }, h("label", {}, "Tenor (quarters)"), numInput("facility.tenor_quarters", draft.facility.tenor_quarters, { label: "Facility tenor in quarters", min: 1, max: 120, step: 1 })),
+    h("div", { class: "field" }, h("label", {}, `Forecast horizon (quarters, 4 to ${fc.max_horizon_quarters})`), numInput("horizon_quarters", draft.horizon_quarters, { label: "Forecast horizon in quarters", min: 4, max: fc.max_horizon_quarters, step: 1 })),
+    fac.deal_currency !== fac.company_currency && fac.company_currency
+      ? h("div", { class: "field" }, h("label", {}, `Exchange rate (${fac.company_currency} per 1 ${fac.deal_currency})`),
+        numInput("facility.fx_rate", draft.facility.fx_rate, { label: "Exchange rate", min: 0 }), h("span", { class: "hint" }, "Needed to include the facility in the forecast"))
+      : null);
+  const thGrid = h("div", { class: "grid2" }, fc.thresholds_def.map((t) =>
+    h("div", { class: "field" }, h("label", {}, `${t.label}${t.unit === "multiple" ? " (x)" : ` (${unit})`}`),
+      numInput(`thresholds.${t.key}`, draft.thresholds[t.key], { label: t.label, placeholder: "Leave blank for no highlight" }))));
+
+  // ---- buttons ----
+  const saveBtn = h("button", { type: "button" }, "Save assumptions");
+  saveBtn.addEventListener("click", async () => {
+    if (needName()) return;
+    if (!window.confirm("Save these forecast assumptions?\n\nThey are recorded in the audit trail under your name. The AI commentary, risks and memo (Sections 3-5) will be marked out of date so you can re-run them with the new forecast.")) return;
+    try {
+      await busy(saveBtn, "Saving...", () => api("PUT", `/deals/${deal.deal_id}/forecast`, { assumptions: draft, analyst_name: analyst() }));
+      toast("Forecast assumptions saved. Re-run the AI analysis to use them.", true);
+      await rerender();
+    } catch (e) { showErrors(e); }
+  });
+  const resetBtn = h("button", { type: "button", class: "secondary" }, "Reset to defaults");
+  resetBtn.addEventListener("click", async () => {
+    if (needName()) return;
+    if (!window.confirm("Discard the saved assumptions and return to the database averages?")) return;
+    try {
+      await busy(resetBtn, "Resetting...", () => api("DELETE", `/deals/${deal.deal_id}/forecast?analyst_name=${encodeURIComponent(analyst())}`));
+      await rerender();
+    } catch (e) { }
+  });
+
+  const showErrors = (e) => {
+    Object.values(inputs).forEach((el) => el.removeAttribute("aria-invalid"));
+    const fields = e?.body?.fields || [];
+    fields.forEach((f) => {
+      const key = f.field.includes(".") && !f.field.startsWith("facility") && !f.field.startsWith("thresholds") ? `scenarios.${f.field}` : f.field;
+      inputs[key]?.setAttribute("aria-invalid", "true");
+    });
+    fieldErr.textContent = fields.length ? fields.map((f) => `${f.field}: ${f.reason}`).join("; ") : e ? errText(e) : "";
+  };
+
+  let timer = null;
+  const schedule = () => { clearTimeout(timer); timer = setTimeout(preview, 450); };
+  const preview = async () => {
+    try {
+      current = await api("POST", `/deals/${deal.deal_id}/forecast/preview`, { assumptions: draft });
+      showErrors(null);
+      for (const [s] of SCEN) for (const p of fc.params) {
+        const el = document.getElementById(`src-${s}-${p.key}`);
+        if (el) el.textContent = current.sources[s][p.key];
+      }
+      facAmount.textContent = current.facility.value != null ? `${current.facility.value.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${unit}` : "Not included";
+      renderResults();
+    } catch (e) { showErrors(e); }
+  };
+
+  // ---- results ----
+  const renderResults = () => {
+    charts.splice(0).forEach((c) => { c.destroy(); state.charts = state.charts.filter((x) => x !== c); });
+    const r = current;
+    const th = r.assumptions.thresholds;
+    const fmtTh = (key) => { const d = r.thresholds_def.find((t) => t.key === key); return th[key] == null ? null : `${th[key]}${d.unit === "multiple" ? "x" : ` ${unit}`}`; };
+    const cell = (pt) => h("td", { class: pt && pt.breach ? "breach" : null, title: pt && pt.breach ? `Breaches ${pt.breach.label} of ${pt.breach.threshold_display}` : pt ? pt.evidence_id : null },
+      pt ? pt.display : "-", pt && pt.breach ? " \u26a0" : "");
+    const sumCell = (s, key, metric) => {
+      const v = r.scenarios[s].summary[key];
+      if (!v) return h("td", {}, "-");
+      const pt = r.scenarios[s].series[metric].find((p) => p.period === v.period);
+      return h("td", { class: pt && pt.breach ? "breach" : null }, v.display, h("div", { class: "small muted" }, v.period), pt && pt.breach ? h("div", { class: "small" }, `\u26a0 ${pt.breach.threshold.startsWith("max") ? "above" : "below"} ${pt.breach.threshold_display}`) : null);
+    };
+    const summary = h("table", { class: "fc-summary" },
+      h("caption", { class: "small muted" }, `Forecast ${r.periods[0]} to ${r.periods.at(-1)} from ${r.start_period}. Amounts in ${unit}. Highlighted cells breach a threshold you entered.`),
+      h("thead", {}, h("tr", {}, ["Scenario", "Lowest DSCR", "Lowest interest coverage", "Highest Debt/EBITDA", "Lowest cash after debt service", "Cash at end of horizon", "Quarters where cash flow < debt service"].map((x) => h("th", {}, x)))),
+      h("tbody", {}, SCEN.map(([s, l]) => {
+        const sm = r.scenarios[s].summary;
+        return h("tr", {}, h("th", { scope: "row" }, h("span", { class: "dot", style: `background:${SCEN_COLOUR[s]}` }), ` ${l}`),
+          sumCell(s, "min_dscr", "DSCR"), sumCell(s, "min_interest_coverage", "INTEREST_COVERAGE"), sumCell(s, "max_debt_ebitda", "DEBT_EBITDA"),
+          sumCell(s, "min_cash", "CASH"), h("td", {}, sm.final_cash.display),
+          h("td", { class: sm.shortfall_quarters.length ? "breach" : null }, sm.shortfall_quarters.length ? `${sm.shortfall_quarters.length} of ${r.periods.length} (first ${sm.shortfall_quarters[0]})` : "None"));
+      })));
+    const breachList = r.breaches.length
+      ? h("details", { class: "fc-breaches" }, h("summary", {}, `Threshold breaches (${r.breaches.length})`),
+        h("ul", { class: "small" }, r.breaches.slice(0, 200).map((b) => h("li", {}, `${b.scenario}: ${b.metric_label} ${b.display} in ${b.period} vs ${b.threshold_label} ${b.threshold_display} `, h("code", {}, b.evidence_id)))))
+      : (Object.values(th).some((v) => v != null) ? h("p", { class: "small ready-line" }, "No threshold is breached in any scenario.") : h("p", { class: "small muted" }, "Enter thresholds above to highlight quarters that breach them."));
+
+    // charts: history (where the workbook uses the same definition) + three scenarios
+    const labels = [...(r.history_periods || []), ...r.periods.map((p) => `${p} (F)`)];
+    const nh = (r.history_periods || []).length;
+    const grid = h("div", { class: "fc-grid" });
+    for (const [key, title] of FC_CHARTS) {
+      const mdef = r.metrics_def.find((m) => m.key === key);
+      const canvas = h("canvas", { role: "img", "aria-label": `${title}: history and base, upside and downside forecasts. Values are in the tables below.` });
+      const hist = r.history[key];
+      const datasets = [];
+      if (hist) {
+        datasets.push({ label: "Database (history)", data: [...hist.map((p) => p.value), ...r.periods.map(() => null)], displays: [...hist.map((p) => p.display), ...r.periods.map(() => "")],
+          borderColor: "#0f2d4e", backgroundColor: "#0f2d4e", borderWidth: 2.5, pointRadius: 3.5, tension: .2 });
+      }
+      for (const [s, l] of SCEN) {
+        const series = r.scenarios[s].series[key];
+        const lead = hist ? hist.map((p, i) => (i === nh - 1 ? p.value : null)) : Array(nh).fill(null);
+        datasets.push({ label: `${l} (forecast)`, data: [...lead, ...series.map((p) => p.value)], displays: [...(hist ? hist.map((p) => p.display) : Array(nh).fill("")), ...series.map((p) => p.display)],
+          borderColor: SCEN_COLOUR[s], backgroundColor: SCEN_COLOUR[s], borderDash: [6, 4], borderWidth: 2, tension: .2, spanGaps: false,
+          pointRadius: [...Array(nh).fill(0), ...series.map((p) => (p.breach ? 5 : 2.5))], pointStyle: [...Array(nh).fill("circle"), ...series.map((p) => (p.breach ? "triangle" : "circle"))] });
+      }
+      const tKey = THRESHOLD_FOR[key];
+      if (tKey && th[tKey] != null) {
+        datasets.push({ label: `Your threshold (${fmtTh(tKey)})`, data: labels.map((_, i) => (i >= nh ? th[tKey] : null)), displays: labels.map(() => fmtTh(tKey)),
+          borderColor: "#5a6676", borderDash: [2, 3], borderWidth: 1.5, pointRadius: 0 });
+      }
+      const chart = new Chart(canvas, {
+        type: "line", data: { labels, datasets },
+        options: { responsive: true, maintainAspectRatio: false, animation: false, spanGaps: false,
+          plugins: { legend: { position: "bottom", labels: { usePointStyle: true, boxWidth: 8, font: { size: 11 } } },
+            tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.dataset.displays[ctx.dataIndex] || "n/m"}` } } },
+          scales: { x: { ticks: { font: { size: 10 }, maxRotation: 60, autoSkip: true } },
+            y: { title: { display: true, text: unitLabel(mdef.unit, unit), font: { size: 11 } }, grace: "8%" } } },
+      });
+      charts.push(chart); state.charts.push(chart);
+      grid.append(h("div", { class: "fc-chart" }, h("p", { class: "chart-unit" }, title, hist ? "" : " (forecast only)"), h("div", { class: "chart-box" }, canvas)));
+    }
+
+    const detail = SCEN.map(([s, l]) => h("details", { class: "data-table" }, h("summary", {}, `${l} case: quarterly forecast table`),
+      h("div", { class: "table-wrap" }, h("table", { class: "fc-detail" },
+        h("thead", {}, h("tr", {}, h("th", {}, `Metric (${unit} unless stated)`), r.periods.map((p) => h("th", {}, p)))),
+        h("tbody", {}, FC_TABLE.map((k) => h("tr", {}, h("th", { scope: "row" }, r.metrics_def.find((m) => m.key === k).label),
+          r.scenarios[s].series[k].map((pt) => cell(pt)))))))));
+
+    results.replaceChildren(...[
+      r.warnings.length ? h("div", { class: "disclaimer" }, h("ul", { style: "margin:0" }, r.warnings.map((w) => h("li", {}, w)))) : null,
+      h("div", { class: "table-wrap" }, summary), breachList, grid, ...detail,
+      h("details", { class: "data-table" }, h("summary", {}, "How the forecast is calculated"), h("ul", { class: "small" }, r.notes.map((n) => h("li", {}, n))))].filter(Boolean));
+  };
+
+  body.append(
+    h("p", {}, "Calculated by the backend in Python from the database figures and the assumptions below; the AI calculates nothing. Every forecast value has an FC- Evidence ID that the AI commentary and memo cite. Figures are projections from stated assumptions, not reported results."),
+    statusLine,
+    h("h4", {}, "Scenario assumptions"), h("div", { class: "table-wrap" }, aTable),
+    h("h4", {}, "Requested facility and horizon"), facGrid,
+    h("h4", {}, "Your thresholds (optional)"), h("p", { class: "small muted" }, "Forecast quarters that breach a threshold are highlighted. Leave blank for no highlight."), thGrid,
+    fieldErr,
+    h("div", { class: "row", style: "margin-top:12px" }, saveBtn, resetBtn, h("span", { class: "small muted" }, "Changes preview immediately; save to use them in the AI analysis and memo.")),
+    h("h4", {}, "Results"), results,
+    h("h4", { class: "commentary-head", style: "margin-top:18px" }, "AI commentary on the forecast"),
+    aiStatements.length ? h("div", {}, aiStatements.map((s) => s3Statement(s))) : h("p", { class: "muted small" }, "No AI forecast commentary yet. Save the assumptions, then run the AI financial analysis."));
+  setStatus();
+  renderResults();
+  return card;
 }
 
 async function screenDashboard() {
@@ -684,7 +954,8 @@ async function screenDashboard() {
       `Flag ${pendingMismatch} pending statement(s) whose figures did not match the database?`)) : null;
   const s3state = deal.sections.s3;
   const top = h("div", { class: "card" },
-    h("p", {}, "Charts use the financial database values directly. The AI commentary beside each chart is checked by Python: every figure must match the cited data and every comparison must match the backend's comparison records."),
+    h("p", {}, `Charts use the financial database values directly${dash.company ? ` (${dash.company}, ${dash.file_name})` : ""}. Below them, the forecast and scenario analysis is calculated by the backend from assumptions you can edit; set and save them before running the AI analysis, because the AI commentary and the memo use them. The AI commentary is checked by Python: every figure must match the cited data and every comparison must match the backend's comparison records.`),
+    dash.calculation_note ? h("p", { class: "small muted" }, dash.calculation_note) : null,
     h("div", { class: "row" }, runBtn,
       has ? h("span", {}, tag(`${counts.Pending} pending`, "warn"), " ", tag(`${counts.Approved} approved`, "ok"), " ", tag(`${counts.Flagged} flagged`, "bad"), " ",
         tag(`${mismatches} number mismatch(es)`, mismatches ? "bad" : "ok")) : null,
@@ -695,17 +966,18 @@ async function screenDashboard() {
     has && !deal.s3_approved ? h("p", { class: "small muted" }, "To approve, every statement must be Approved or Flagged, and any statement with a number mismatch must be corrected or flagged. Read the commentary beside each chart first; use the bulk buttons for the remaining routine statements.") : null,
     bulkRow);
 
-  const panels = !has ? [] : dash.panels.map((p) => {
+  const panels = dash.panels.map((p) => {
     const latest = p.metrics.length ? h("div", { class: "latest" }, p.metrics.map((m) => {
       const c = m.latest_comparison;
-      // Colour the delta by whether the move is favourable, not just its direction.
-      // For lower-is-better metrics (Debt/EBITDA, DSO) a rise is unfavourable.
-      const lowerBetter = m.key === "DEBT_EBITDA" || m.key === "DSO";
+      // Colour the delta by whether the move is favourable, not just its direction (from the backend:
+      // "lower" = lower is better, e.g. Debt/EBITDA, DSO; "neutral" = neither, e.g. capex).
+      const lowerBetter = m.better ? m.better === "lower" : m.key === "DEBT_EBITDA" || m.key === "DSO";
       let tone = "flat";
-      if (c && c.direction === "up") tone = lowerBetter ? "down" : "up";
+      if (m.better === "neutral") tone = "flat";
+      else if (c && c.direction === "up") tone = lowerBetter ? "down" : "up";
       else if (c && c.direction === "down") tone = lowerBetter ? "up" : "down";
       return h("div", { class: "metric" },
-        h("div", { class: "metric-label" }, m.label),
+        h("div", { class: "metric-label", title: m.basis || null }, m.label, m.unit_label ? ` (${m.unit_label})` : ""),
         h("div", { class: "metric-value" }, h("b", {}, m.latest.display), h("span", { class: "metric-period" }, m.latest.period)),
         m.latest.flags.length ? h("div", { class: "metric-flags" }, m.latest.flags.map((f) => tag(f, "warn"))) : null,
         c ? h("div", { class: `metric-delta ${tone}` }, c.direction === "~" ? "\u2192 stable" : (c.direction === "up" ? "\u2191 " : "\u2193 ") + c.change_display)
@@ -718,8 +990,10 @@ async function screenDashboard() {
       h("div", { class: "panel" },
         h("div", { class: "panel-data" }, panelCharts(p, dash.periods), latest,
           p.not_available.length ? h("p", { class: "not-avail" }, h("b", {}, "Not available in database: "), p.not_available.join(", ")) : null, dataTable(p, dash.periods)),
-        h("div", { class: "panel-commentary" }, h("h4", { class: "commentary-head" }, "AI commentary"), commentary)));
+        h("div", { class: "panel-commentary" }, h("h4", { class: "commentary-head" }, "AI commentary"),
+          commentary.length ? commentary : h("p", { class: "muted small" }, "No AI commentary yet. Run the AI financial analysis above."))));
   });
+  const fcCard = await forecastCard(deal, stmts.filter((s) => s.group === "forecast"));
 
   const extra = [];
   if (has) {
@@ -737,9 +1011,9 @@ async function screenDashboard() {
           h("div", { class: "repay-col weakens" }, h("p", { class: "repay-head" }, "\u26a0 Weakens repayment"), stmts.filter((s) => s.group === `repayment:${d}:weakens`).map((s) => s3Statement(s))))))));
   }
   const emptyState = has ? null : h("div", { class: "empty" },
-    "No financial analysis yet. Click \u201cRun AI financial analysis\u201d above to generate the trend charts, dashboard and AI commentary for this deal.");
-  $main.replaceChildren(h("h2", {}, "Section 3: Financial trend dashboard and AI analysis"), top, emptyState, ...panels, ...extra,
-    nextSection(deal.deal_id, "risks"));
+    "No AI analysis yet. Review the charts and the forecast assumptions below, then click \u201cRun AI financial analysis\u201d above to add the AI commentary.");
+  $main.replaceChildren(...[h("h2", {}, "Section 3: Financial trend dashboard and AI analysis"), top, emptyState, ...panels, fcCard, ...extra,
+    nextSection(deal.deal_id, "risks")].filter(Boolean));
 }
 
 // --------------------------------------------------------------------------- Section 4

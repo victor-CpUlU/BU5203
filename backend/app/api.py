@@ -13,7 +13,8 @@ from pydantic import BaseModel
 
 from . import documents as docs
 from . import export, lifecycle, review, sections
-from .financial import LoadError, build_dashboard, load_csv
+from . import forecast as fcast
+from .financial import LoadError, build_dashboard, load_database
 from .settings import get_settings
 from .storage import AppError, Repo, deal_lock, now_iso
 
@@ -133,9 +134,14 @@ def auto_connect_financial(r: Repo, deal_id: str) -> None:
     s = get_settings()
     deal = r.get_deal(deal_id)
     try:
-        res = load_csv(s.financial_db_path, deal["intake"]["DI-BORROWER"]["display"], True, s.large_swing, s.stable_band)
+        res = load_database(s.financial_db_path, deal["intake"]["DI-BORROWER"]["display"], s.large_swing, s.stable_band)
     except LoadError as exc:
         with deal_lock(deal_id):
+            # Remove any dataset from an earlier connection so no section can use another borrower's figures.
+            for name in ("financial/dataset.json", "financial/csv_evidence.json"):
+                p = r.path(deal_id, *name.split("/"))
+                if p.exists():
+                    p.unlink()
             deal = r.get_deal(deal_id)
             deal["financial"].update({"status": "error", "source": None, "file_name": s.financial_db_path.name,
                                       "error": str(exc), "loaded_at": now_iso()})
@@ -146,7 +152,8 @@ def auto_connect_financial(r: Repo, deal_id: str) -> None:
     ds = res["dataset"]
     with deal_lock(deal_id):
         r.append_audit(deal_id, {"type": "financial_connected", "analyst_name": "System", "file_name": ds["file_name"],
-                                 "values": len(res["evidence"])})
+                                 "values": len(res["evidence"]), "sheet": ds.get("sheet"), "company": ds.get("company"),
+                                 "calculation_note": ds.get("calculation_note")})
         r.write(deal_id, "financial/dataset.json", ds)
         r.write(deal_id, "financial/csv_evidence.json", res["evidence"])
         deal = r.get_deal(deal_id)
@@ -200,7 +207,11 @@ def update_deal(deal_id: str, req: IntakeRequest):
         r.save_deal(deal)
     if borrower_changed:
         # Re-fetch the financial database for the new borrower (overwrites the connected dataset).
+        # Saved forecast assumptions belonged to the old borrower's data, so they are cleared.
         auto_connect_financial(r, deal_id)
+        p = r.path(deal_id, "forecast", "assumptions.json")
+        if p.exists():
+            p.unlink()
     return r.get_deal(deal_id)
 
 
@@ -292,6 +303,105 @@ def dashboard(deal_id: str):
     if not ds:
         raise AppError(404, "no_dataset", "The financial database is not connected for this deal.")
     return build_dashboard(ds)
+
+
+def _mark_stale_from_s3(deal: dict, reason: str) -> None:
+    before = {k: deal["sections"][k]["status"] for k in ("s3", "s4", "s5")}
+    Repo.mark_later_stale(deal, "s2a")  # Section 3 onward
+    for k, was in before.items():
+        if was == "completed" and deal["sections"][k]["status"] == "stale":
+            deal["sections"][k]["message"] = f"Out of date: {reason}."
+
+
+class AnalystRequest(BaseModel):
+    analyst_name: str | None = None
+
+
+@router.post("/deals/{deal_id}/financial/reconnect")
+def reconnect_financial(deal_id: str, req: AnalystRequest):
+    """Re-read the financial database (e.g. after the workbook was updated). Saved forecast assumptions are
+    cleared because their defaults come from the old data; Section 3 onward is marked out of date."""
+    r = repo()
+    name = review.valid_name(req.analyst_name)
+    r.get_deal(deal_id)
+    auto_connect_financial(r, deal_id)
+    with deal_lock(deal_id):
+        p = r.path(deal_id, "forecast", "assumptions.json")
+        if p.exists():
+            p.unlink()
+        deal = r.get_deal(deal_id)
+        r.append_audit(deal_id, {"type": "financial_reconnected", "analyst_name": name, "status": deal["financial"]["status"],
+                                 "note": "Forecast assumptions reset to the defaults from the reconnected data."})
+        _mark_stale_from_s3(deal, "the financial database was reconnected")
+        r.save_deal(deal)
+    return r.get_deal(deal_id)
+
+
+# --------------------------------------------------------------------------- forecast and scenarios
+class ForecastRequest(BaseModel):
+    analyst_name: str | None = None
+    assumptions: dict | None = None
+
+
+def _forecast_view(fc: dict) -> dict:
+    return {k: v for k, v in fc.items() if k != "evidence"}
+
+
+def _forecast_or_422(r: Repo, deal: dict, assumptions: dict | None) -> dict:
+    try:
+        return fcast.for_deal(r, deal, get_settings(), assumptions_override=assumptions)
+    except fcast.ForecastInputError as exc:
+        raise AppError(422, "invalid_assumptions", "Please correct the highlighted assumptions.", fields=exc.errors) from exc
+
+
+@router.get("/deals/{deal_id}/forecast")
+def get_forecast(deal_id: str):
+    r = repo()
+    return _forecast_view(_forecast_or_422(r, r.get_deal(deal_id), None))
+
+
+@router.post("/deals/{deal_id}/forecast/preview")
+def preview_forecast(deal_id: str, req: ForecastRequest):
+    """Recalculate with unsaved assumptions (nothing is stored)."""
+    r = repo()
+    return _forecast_view(_forecast_or_422(r, r.get_deal(deal_id), req.assumptions or {}))
+
+
+@router.put("/deals/{deal_id}/forecast")
+def save_forecast(deal_id: str, req: ForecastRequest):
+    r = repo()
+    name = review.valid_name(req.analyst_name)
+    deal = r.get_deal(deal_id)
+    fc = _forecast_or_422(r, deal, req.assumptions or {})
+    if not fc["available"]:
+        raise AppError(409, "forecast_unavailable", fc["message"])
+    clean = fc["assumptions"]
+    changed = [f"{s}.{p}" for s, v in fc["sources"].items() for p, src in v.items() if src == "Set by the analyst"]
+    with deal_lock(deal_id):
+        r.append_audit(deal_id, {"type": "forecast_assumptions_saved", "analyst_name": name, "assumptions": clean,
+                                 "changed_from_defaults": changed})
+        r.write(deal_id, "forecast/assumptions.json", {**clean, "saved_by": name, "saved_at": now_iso()})
+        deal = r.get_deal(deal_id)
+        _mark_stale_from_s3(deal, "the forecast assumptions changed")
+        r.save_deal(deal)
+    return _forecast_view(_forecast_or_422(r, r.get_deal(deal_id), None))
+
+
+@router.delete("/deals/{deal_id}/forecast")
+def reset_forecast(deal_id: str, analyst_name: str | None = None):
+    """Discard saved assumptions and return to the historical-average defaults."""
+    r = repo()
+    name = review.valid_name(analyst_name)
+    r.get_deal(deal_id)
+    with deal_lock(deal_id):
+        p = r.path(deal_id, "forecast", "assumptions.json")
+        if p.exists():
+            p.unlink()
+            r.append_audit(deal_id, {"type": "forecast_assumptions_reset", "analyst_name": name})
+            deal = r.get_deal(deal_id)
+            _mark_stale_from_s3(deal, "the forecast assumptions changed")
+            r.save_deal(deal)
+    return _forecast_view(_forecast_or_422(r, r.get_deal(deal_id), None))
 
 
 # --------------------------------------------------------------------------- sections

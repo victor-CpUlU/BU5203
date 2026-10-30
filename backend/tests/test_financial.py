@@ -6,45 +6,64 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from app.financial import (CANONICAL_KEYS, LoadError, build_comparisons, build_dashboard, change_display, direction,
-                           format_value, load_csv, map_label, parse_cell, parse_period_header, raw_change)
+                           format_value, load_csv, load_workbook, map_label, parse_cell, parse_period_header, raw_change)
 from app.settings import DEFAULT_LARGE_SWING, DEFAULT_STABLE_BAND, resolve_stable_bands, resolve_thresholds
 from conftest import ROOT
 
-INTEL = ROOT / "intel_quarterly_ratios.csv"
+WORKBOOK = ROOT / "Semiconductor_Financial_Performance_Indicators_Combined.xlsx"
+SMALL_CSV = "Metric,Q1 2026 (Mar 28 2026),Q2 2026 (Jun 27 2026)\nDSCR,0.00x,0.64x\nOperating Cash Flow,1096,7006\n"
 
 
-def load(path=INTEL, confirm=True):
+def load(path, confirm=True):
     return load_csv(path, "Intel Corporation", confirm, DEFAULT_LARGE_SWING, DEFAULT_STABLE_BAND)
 
 
-def test_golden_intel_csv():
-    res = load()
+def load_wb(borrower="Intel Corporation"):
+    return load_workbook(WORKBOOK, borrower, DEFAULT_LARGE_SWING, DEFAULT_STABLE_BAND)
+
+
+def test_golden_intel_workbook():
+    res = load_wb()
     ds = res["dataset"]
-    assert [p["label"] for p in ds["periods"]] == ["Q3-2025", "Q4-2025", "Q1-2026", "Q2-2026"]
+    assert ds["sheet"] == "Intel" and ds["company"] == "Intel Corporation" and ds["currency_unit"] == "USD m"
+    assert [p["label"] for p in ds["periods"]] == ["Q3-FY2025", "Q4-FY2025", "Q1-FY2026", "Q2-FY2026"]
     assert [m["key"] for m in ds["metrics"]] == CANONICAL_KEYS
     assert all(m["recognised"] for m in ds["metrics"])
-    assert sum(len(m["entries"]) for m in ds["metrics"]) == 40 == len(res["evidence"])
-    assert len(ds["comparisons"]) == 30
+    assert sum(len(m["entries"]) for m in ds["metrics"]) == 4 * len(CANONICAL_KEYS) == len(res["evidence"])
     by = {m["key"]: {e["period"]: e for e in m["entries"]} for m in ds["metrics"]}
-    assert by["DSCR"]["Q2-2026"]["display"] == "0.64x" and by["DSCR"]["Q2-2026"]["evidence_id"] == "CSV-DSCR-Q2-2026"
-    assert by["INTEREST_COVERAGE"]["Q2-2026"]["display"] == "5.6x"
-    assert by["OPERATING_CASH_FLOW"]["Q3-2025"]["display"] == "2546"
-    assert by["DSO"]["Q1-2026"]["unit"] == "days"
+    # values follow the workbook's own formulas (Debt/EBITDA LTM matches the earlier Intel database figure)
+    assert by["DEBT_EBITDA"]["Q2-FY2026"]["display"] == "4.11x" and by["DEBT_EBITDA"]["Q2-FY2026"]["evidence_id"] == "CSV-DEBT_EBITDA-Q2-FY2026"
+    assert by["DSCR"]["Q2-FY2026"]["display"] == "0.90x" and by["DSCR"]["Q2-FY2026"]["cell"] == "Intel!C29"
+    assert by["INTEREST_COVERAGE"]["Q2-FY2026"]["display"] == "5.60x"
+    assert by["OPERATING_CASH_FLOW"]["Q3-FY2025"]["display"] == "2,546" and by["REVENUE_GROWTH"]["Q2-FY2026"]["display"] == "18.79%"
+    assert by["DSO"]["Q1-FY2026"]["unit"] == "days"
     # anomaly flags (Req 29.4)
-    assert "zero value" in by["EBITDA_MARGIN"]["Q1-2026"]["flags"] and "zero value" in by["DSCR"]["Q1-2026"]["flags"]
-    assert by["EBITDA_MARGIN"]["Q1-2026"]["value"] == "0.00"  # zero is used as the real value
-    assert "negative value" in by["INTEREST_COVERAGE"]["Q1-2026"]["flags"]
-    assert "negative value" not in by["REVENUE_GROWTH"]["Q4-2025"]["flags"]
-    assert all("unit not stated" in e["flags"] for k in ("OPERATING_CASH_FLOW", "WORKING_CAPITAL") for e in by[k].values())
-    assert "large swing" in by["DSCR"]["Q4-2025"]["flags"] and "large swing" not in by["DSCR"]["Q2-2026"]["flags"]
-    assert all(not d["assessable"] for d in ds["divergence"])
-    assert "Database has no borrower identifier" in ds["information_gaps"]
+    assert "zero value" in by["EBITDA_MARGIN"]["Q1-FY2026"]["flags"] and by["EBITDA_MARGIN"]["Q1-FY2026"]["value"] == "0.00"
+    assert "negative value" in by["INTEREST_COVERAGE"]["Q1-FY2026"]["flags"]
+    assert "negative value" not in by["REVENUE_GROWTH"]["Q1-FY2026"]["flags"]
+    assert not any("unit not stated" in e["flags"] for m in by.values() for e in m.values())  # the workbook states USD m
+    assert "large swing" in by["DSCR"]["Q4-FY2025"]["flags"] and "large swing" not in by["DSCR"]["Q2-FY2026"]["flags"]
+    assert all(d["assessable"] for d in ds["divergence"]) and ds["unavailable_metrics"] == ["Net Profit Margin"]
 
 
-def test_needs_confirmation_and_decline():
-    assert load(confirm=None)["status"] == "needs_confirmation"
+def test_workbook_borrower_matching():
+    assert load_wb("Micron Technology, Inc.")["dataset"]["sheet"] == "Micron"
+    assert load_wb("Taiwan Semiconductor Manufacturing Company Limited")["dataset"]["currency_unit"] == "NT$ bn"
+    micron = {m["key"]: m for m in load_wb("Micron Technology")["dataset"]["metrics"]}
+    assert micron["INTEREST_COVERAGE"]["entries"][-1]["display"] == "n/m"
+    with pytest.raises(LoadError, match="No company"):
+        load_wb("Acme Semiconductors")
+
+
+def test_needs_confirmation_and_decline(tmp_path):
+    p = tmp_path / "a.csv"
+    p.write_text(SMALL_CSV)
+    assert load(p, confirm=None)["status"] == "needs_confirmation"
     with pytest.raises(LoadError):
-        load(confirm=False)
+        load(p, confirm=False)
+    ds = load(p)["dataset"]
+    assert "Database has no borrower identifier" in ds["information_gaps"]
+    assert all("unit not stated" in e["flags"] for m in ds["metrics"] if m["key"] == "OPERATING_CASH_FLOW" for e in m["entries"])
 
 
 def test_label_mapping_and_header_parsing():
@@ -103,10 +122,10 @@ def test_comparisons_only_adjacent_non_null():
 
 
 def test_dashboard_panels():
-    dash = build_dashboard(load()["dataset"])
+    dash = build_dashboard(load_wb()["dataset"])
     assert [p["key"] for p in dash["panels"]] == ["profitability", "leverage", "liquidity", "cash_flow", "debt_servicing"]
     prof = dash["panels"][0]
-    assert "Revenue" in prof["not_available"] and prof["metrics"][0]["latest"]["display"] == "25.40%"
+    assert prof["not_available"] == ["Net Profit Margin"] and prof["metrics"][0]["latest"]["display"] == "16,128"
 
 
 def test_threshold_fallback():

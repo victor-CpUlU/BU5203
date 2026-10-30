@@ -1,10 +1,66 @@
 # AI-Assisted Credit Analysis: User Guide
 
-This app helps a credit analyst decide whether a borrower can support a specific loan request. The analyst uploads the borrower's filings and a financial database (CSV). The AI extracts information and drafts the analysis and credit memo. Python checks every figure and citation, and the analyst reviews and approves everything before the final memo is produced.
+This app helps a credit analyst decide whether a borrower can support a specific loan request. The analyst uploads the borrower's filings (PDFs). The app connects automatically to a financial database, the workbook `Semiconductor_Financial_Performance_Indicators_Combined.xlsx`, which covers AMD, Intel, Micron, NVIDIA and TSMC. The AI extracts information from the filings and drafts the analysis and credit memo. Python supplies and checks every figure and citation, and the analyst reviews and approves everything before the final memo is produced.
 
 > The app runs only on your own computer and has **no login**. Do not put it on a shared network without adding access control.
 
 > **Developers:** this file is the user guide. For the design spec, pipeline rules, data conventions and the AI prompts, see [`Instructions.md`](Instructions.md). See [section 8](#8-for-developers) for the developer workflow.
+
+**Quick start:** install Python 3.11+ and the Kiro CLI, then run `kiro-cli login` ([setup](#1-first-time-setup)). Double-click `start.bat`, create a deal for one of the five companies, upload its PDFs, and work through Sections 1 to 6 in the left-hand menu ([walkthrough](#3-using-the-app-section-by-section)).
+
+---
+
+## Where the numbers come from, and what the AI does
+
+**The AI never calculates a number.** Every figure in the app comes from the financial database or from Python. The AI writes sentences that quote those figures, and Python checks every quoted figure against its source before the analyst sees it.
+
+| What you see | Produced by | How |
+|---|---|---|
+| Historical figures and ratios (Revenue, EBITDA, Debt/EBITDA, DSCR, interest coverage, current ratio, ...) | **Financial database** | Read from the borrower's sheet in the workbook. Each ratio is defined by the workbook's own formula over its `Inputs` sheet. If the file has no saved formula results, Python evaluates those formulas exactly as written. It never invents its own definition. Definitions can differ by company (for example, DSCR is a proxy for AMD and NVIDIA); hover a metric name to see its definition. |
+| Quarter-on-quarter changes and up/down/stable labels | **Python** | Difference between consecutive quarters: percentage points for %, x for multiples, days for DSO, % change for amounts. "Stable" bands are in `config/analysis.toml`. |
+| Flags (zero, negative, large swing, n/m, blank) | **Python** | Fixed rules, listed in `Instructions.md` 4.4. Values are never changed. |
+| Divergence patterns (e.g. revenue up while operating cash flow down) | **Python** | Compares the up/down labels of two metrics in the same quarters. |
+| Forecast, scenarios and pro-forma debt service | **Python**, from **analyst-editable assumptions** | See [the forecast model](#how-the-forecast-is-calculated) below. Base-case defaults are the averages of the database quarters. |
+| Thresholds that highlight forecast quarters | **Analyst** | Optional; there are no defaults and no pass/fail result. |
+| 2A business and 2B debt statements from the PDFs | **AI**, checked by Python | The AI summarises each fact and quotes a passage from the page. Python checks the quote really is on the cited page, and that every debt figure appears in the quote. Whether the summary matches the quote is for the analyst to judge. |
+| Trend commentary, risk list (impact, likelihood, ranking), mitigants, proposed covenants, memo text | **AI**, checked by Python | The AI may only quote figures it was given, with their Evidence IDs. Python marks each statement **Numbers verified** or **Number mismatch** and rejects citations that don't exist. Covenant thresholds and forecast statements are always labelled **ASSUMPTION**. |
+| Information gaps, flagged-value checks and scenario summaries in the memo | **Python** | Written by the app, not the AI, and marked "Backend-generated". |
+| Approve, flag or correct, and the final decision | **Analyst** | Nothing is final until the analyst approves it. The AI never approves, declines or recommends the loan. |
+
+**Evidence IDs** show where each figure comes from. Click any ID in the app to see its source.
+
+| ID | Source |
+|---|---|
+| `CSV-...` | A database value (workbook sheet, cell and formula) |
+| `FC-...` | A forecast value |
+| `FA-...` | A forecast assumption |
+| `FT-...` | A threshold you entered |
+| `EV-...` | A passage in an uploaded PDF |
+| `DI-...` | A field from the deal intake |
+
+### How the forecast is calculated
+
+Python projects each quarter forward from the latest database quarter, for a base, an upside and a downside case:
+
+- **Revenue** = previous quarter x (1 + revenue growth per quarter)
+- **EBITDA** = revenue x EBITDA margin; **capex** = revenue x capex % of revenue
+- **Cash flow available for debt service** = EBITDA - capex (before tax, working capital, dividends and buybacks)
+- **Interest** = latest quarterly interest x (1 + scenario change) + facility balance x facility rate / 4
+- **Principal** = existing short-term debt repaid over 4 quarters + the requested facility (bullet at the end, or equal quarterly instalments)
+- **DSCR** = cash flow available / (interest + principal); **interest coverage** = EBITDA / interest
+- **Debt/EBITDA** = total debt / EBITDA of the last 4 quarters
+- **Cash after debt service** = previous cash + cash flow available - debt service
+
+Defaults:
+- The base case uses the averages of the database quarters for revenue growth, EBITDA margin and capex %.
+- Upside and downside add illustrative shocks from `config/analysis.toml`.
+- The facility rate defaults to an illustrative 6% per year.
+
+The analyst can change every assumption on the dashboard, and the forecast and its charts recalculate immediately. Saved assumptions are recorded in the audit trail.
+
+Limits:
+- Long-term debt maturities aren't in the database, so they aren't in debt service.
+- The forecast DSCR uses the formula above, not each company's historical definition.
 
 ---
 
@@ -97,7 +153,7 @@ The badge at the top right shows which AI provider is in use. A red **"AI not co
 
 - **Enter your name** in the **Analyst name** box at the top of the page. It is recorded with every approval, flag and correction in the audit trail. Your browser remembers it.
 - **Get the borrower's documents as PDFs**, for example the 10-K, 10-Q, annual report or audited financial statements. SEC EDGAR filings are web pages, so download the PDF from the company's investor relations site, or open the filing in your browser and use **Print → Save as PDF**. Scanned PDFs without selectable text can be uploaded but cannot be read.
-- **The financial database is connected automatically.** You don't load or upload it. The app fetches the borrower's figures from the external financial database (by default `intel_quarterly_ratios.csv`) as soon as you create the deal, and shows them in Section 2. See [section 5](#5-financial-database-csv-format) for the format the database uses.
+- **The financial database is connected automatically.** You don't load or upload it. The app fetches the borrower's figures from the external financial database (by default `Semiconductor_Financial_Performance_Indicators_Combined.xlsx`, which covers AMD, Intel, Micron, NVIDIA and TSMC) as soon as you create the deal, and shows them in Section 2. The borrower name must match one of these companies, for example "Intel Corporation" or "Micron Technology". See [section 5](#5-financial-database-format) for the format the database uses.
 
 ---
 
@@ -129,17 +185,25 @@ Each item gets an **Evidence ID** (`EV-001`, ...). The app then checks that the 
 
 You can re-run 2A or 2B on its own. Long filings take a few minutes because pages are sent in batches.
 
-**2C Financial data (external database).** Below 2A and 2B, Section 2 shows the figures fetched automatically from the external financial database when the deal was created, with a note that they come from the database. The AI never extracts or calculates these numbers; Python loads them exactly as stored (with Pandas). This card lists the periods and metrics found, the **values flagged for review** and the **information gaps**. Each value has a `CSV-` Evidence ID used throughout the memo.
+**2C Financial data (external database).** Below 2A and 2B, Section 2 shows the figures fetched automatically from the external financial database when the deal was created, with a note that they come from the database. The AI never extracts or calculates these numbers. The ratios are the workbook's own; if the workbook has no saved formula results, Python evaluates the workbook's formulas exactly as written, and the card says so. This card shows the company and sheet, the currency unit, the periods and metrics found, the **values flagged for review** and the **information gaps**. Each value has a `CSV-` Evidence ID used throughout the memo. After the workbook is updated, click **Reconnect financial database** to re-read it (this resets saved forecast assumptions and marks Sections 3-5 out of date).
 
 ### Section 3: Financial dashboard and AI analysis
 
 The dashboard shows five panels: **Profitability, Leverage, Liquidity, Cash Flow and Debt Servicing**.
 
-- **Charts** use the CSV values exactly. A triangle marker means the value is flagged. Each panel has a **data table** (click to expand) and lists any metrics that are **not available in database**.
+- **Charts** use the database values exactly. A triangle marker means the value is flagged. Each panel has a **data table** (click to expand) and lists any metrics that are **not available in database**. Hover a metric name to see how the workbook defines it for this company (for example, DSCR is a proxy for some companies).
 - Click **Run AI financial analysis**. The AI commentary appears beside each chart. Python then checks each statement and marks it:
   - **Numbers verified**: every figure matches the cited data.
   - **Number mismatch**: something doesn't match. The unmatched values are listed.
-- The **Divergence patterns** table shows the five patterns from the Project Details. With the current CSV they are all **Not assessable**, because Revenue, EBITDA, Debt and Cash are not in the database.
+- The **Divergence patterns** table shows the five patterns from the Project Details and, for each, the quarters where Python observed it (for example Revenue up while Operating Cash Flow fell).
+
+**Forecast and scenario analysis.** Below the panels, Python projects the borrower's quarters forward under a **base, upside and downside case**. Set this up before running the AI analysis, because the AI commentary and the memo use it.
+- **Assumptions:** revenue growth per quarter, EBITDA margin, capex as % of revenue, change in interest on existing debt, and the interest rate on the requested facility. Base-case defaults are the averages of the database quarters; upside and downside add illustrative shocks. Each assumption shows its historical reference and where its value came from. Change any value; the results update as you type.
+- **Requested facility:** the amount comes from the deal intake. Set the repayment (bullet or equal quarterly instalments), tenor and forecast horizon. If the loan currency differs from the database (TSMC is in NT$ bn), enter an exchange rate.
+- **Thresholds (optional):** enter a minimum DSCR, minimum interest coverage, maximum Debt/EBITDA or minimum cash. Quarters that breach them are highlighted in red; nothing is marked pass or fail.
+- **Results:** a summary per scenario (lowest DSCR and coverage, highest Debt/EBITDA, cash after debt service, quarters where cash flow is below debt service), charts with history and the three scenarios, and full quarterly tables. Click **How the forecast is calculated** for the formulas.
+- Click **Save assumptions** to use them (your name is recorded in the audit trail). Saving marks Sections 3-5 out of date so you can re-run them. **Reset to defaults** returns to the database averages.
+- After you run the AI analysis, its forecast commentary appears at the bottom of the card. Every forecast statement is labelled **ASSUMPTION** and cites `FC-` (forecast value), `FA-` (assumption) or `FT-` (your threshold) Evidence IDs.
 
 **Review each statement** with **Approve**, **Flag**, **Comment** or **Edit**. An edited statement is checked again and goes back to Pending.
 
@@ -181,7 +245,7 @@ Every statement has an ID (M1, M2, ...), a label and its Evidence IDs:
 - **ASSUMPTION**: a judgement or suggestion.
 - **NOT VERIFIED**: could not be supported.
 
-The app adds the information gaps and flagged database values to Section 7 itself. There is **no AI recommendation**; the analyst decides.
+Section 4 includes **Forecast and scenario analysis**, and pro-forma debt service including the requested facility is taken from the base case. If the AI doesn't cover them, the app adds its own scenario summaries (marked Backend-generated, left Pending for you). The app adds the information gaps and flagged database values to Section 7 itself. There is **no AI recommendation**; the analyst decides.
 
 Regenerating the memo replaces it and resets all Section 6 reviews.
 
@@ -189,7 +253,8 @@ Regenerating the memo replaces it and resets all Section 6 reviews.
 
 1. **Click an Evidence ID** on a statement. The source panel on the right shows:
    - for a document, the document name, page, supporting text and an image of the page with the passage highlighted;
-   - for a CSV value, the file, metric, period column and value, with any flags.
+   - for a database value (`CSV-`), the file, sheet and cell, the workbook formula, metric, period and value, with any flags;
+   - for a forecast value or assumption (`FC-`, `FA-`, `FT-`), the scenario, the value, its source and whether you saved the assumptions.
    If the passage cannot be found on the page, the statement is **flagged automatically**.
 2. Compare the statement with its source. A citation to a real page does not by itself mean the statement is correct.
 3. Use **Approve**, **Flag** (with an optional note) or **Correct**. A corrected statement goes back to **Pending** until you approve it again.
@@ -201,7 +266,7 @@ Regenerating the memo replaces it and resets all Section 6 reviews.
 
 ### Re-running earlier steps
 
-If you re-run an earlier step (for example re-extract documents), the later steps are marked **"Out of date"**. Re-run them so the memo matches the latest data. The financial database is connected once when the deal is created; to pick up changed figures, start a new deal.
+If you re-run an earlier step (for example re-extract documents), the later steps are marked **"Out of date"**. Re-run them so the memo matches the latest data. The financial database is connected when the deal is created or its borrower is changed; to pick up changed figures, click **Reconnect financial database** in Section 2C. Saving or resetting the forecast assumptions also marks Sections 3-5 out of date.
 
 ---
 
@@ -214,21 +279,16 @@ If you re-run an earlier step (for example re-extract documents), the later step
 
 ---
 
-## 5. Financial database (CSV) format
+## 5. Financial database format
 
-```
-Metric,Q2 2026 (Jun 27 2026),Q1 2026 (Mar 28 2026),Q4 2025 (Dec 27 2025),Q3 2025 (Sep 27 2025)
-Revenue Growth,25.40%,7.18%,-4.11%,2.78%
-Debt/EBITDA,4.11x,6.37x,4.93x,5.23x
-Operating Cash Flow,7006,1096,4288,2546
-```
+The database is the Excel workbook `Semiconductor_Financial_Performance_Indicators_Combined.xlsx`, with one KPI sheet per company (`AMD`, `Intel`, `Micron`, `NVIDIA`, `TSMC`) and a matching `<Company> Inputs` sheet. To add a company, copy an existing pair of sheets and keep the same layout:
 
-- **First column:** must be headed `Metric`.
-- **Period headers:** must look like `Q2 2026 (Jun 27 2026)`. They can be in any order; the app sorts them oldest to newest.
-- **Recognised metrics:** Revenue Growth, EBITDA Margin, Debt/EBITDA, Interest Coverage, Current Ratio, Debt-Service Coverage Ratio (DSCR), Operating Cash Flow, Operating Cash Flow Margin, Working Capital, Days Sales Outstanding (DSO). Any other rows are kept and marked "Unrecognised metric".
-- **Values:** `25.40%`, `4.11x`, or a plain number. Empty or text cells show as "Not available in database".
-- **Several borrowers in one file (optional):** add a `Borrower` column. The app then uses only the rows matching the deal's borrower name. Without a `Borrower` column, the whole file is treated as this borrower's data and the app records the information gap "Database has no borrower identifier".
-- **Which file is used:** the app always connects to the default database set by `financial_db_path` (by default `intel_quarterly_ratios.csv` in the project folder). The connection happens automatically when a deal is created.
+- **A1:** "<Company name> – Quarterly Financial Performance Indicators". The borrower name is matched to the sheet name, this company name, or its abbreviation in brackets (Inc., Corporation, Co. and Ltd are ignored).
+- **A4:** "Financial Performance Indicators". **Row 4** from column C: period headers like `Q2 FY2026`. **Row 5:** fiscal period end date. **Row 6:** calendar quarter.
+- **From row 9:** one metric per row, label in column A and unit in column B (`USD m`, `NT$ bn`, `%`, `x`, `Days`). The column after the last period holds the company-specific basis note.
+- **Recognised metrics:** Revenue, Revenue Growth (Q/Q), EBITDA, EBITDA Margin, Total Debt, Net Debt, Debt/Equity, Debt/EBITDA (LTM), Cash & Cash Equivalents, Short-Term Debt, Quick Ratio, Current Ratio, Capital Expenditure, Free Cash Flow, Interest Expense, Interest Coverage, Working Capital, Days Sales Outstanding (DSO), Operating Cash Flow, Operating Cash Flow Margin, Debt Service Coverage Ratio (DSCR), plus the memo rows Revenue Growth (Y/Y), EBITDA (LTM) and EBITDA excl. Asset Impairment Charges. Other rows are kept and marked "Unrecognised metric".
+- **Values:** KPI cells may be formulas. If the file was last saved by Excel, the saved results are used; otherwise the app evaluates the formulas itself (supported: `+ - * / ^`, cell and range references, `SUM`, `IF`, `IFERROR`, `COUNT`, `OR`, `AND`, `ABS`, `MIN`, `MAX`). A blank input is treated as "not verified, not zero", so a value depending on it shows "Not available in database". `n/m` is shown as reported.
+- **Which file is used:** set by `FINANCIAL_DB_PATH` in `.env` (default `Semiconductor_Financial_Performance_Indicators_Combined.xlsx` in the project folder). A legacy single-borrower CSV (`Metric` column and headers like `Q2 2026 (Jun 27 2026)`) is still accepted.
 
 ---
 
@@ -238,7 +298,7 @@ Operating Cash Flow,7006,1096,4288,2546
 No. The analyst uploads the borrower's documents inside the app (Section 1 → Documents), like an AI credit memo tool. Nothing needs to be in the project folder except the financial database file the app connects to.
 
 **Where do the financial figures come from? I never loaded them.**
-The app simulates a connection to an external financial database and fetches the figures automatically when you create the deal, so there is no load or upload step. They appear in Section 2 (2C) with a note that they come from the database, and in the Section 3 dashboard. The default database is `intel_quarterly_ratios.csv` (set by `financial_db_path`).
+The app simulates a connection to an external financial database and fetches the figures automatically when you create the deal, so there is no load or upload step. They appear in Section 2 (2C) with a note that they come from the database, and in the Section 3 dashboard. The default database is `Semiconductor_Financial_Performance_Indicators_Combined.xlsx` (set by `FINANCIAL_DB_PATH`).
 
 **Why does the app need the Kiro CLI? Can't it use the Kiro chat?**
 The Kiro chat in the editor has no way for another program to send it prompts. The Kiro CLI does, and it uses your Kiro account, so it is the way to run the app on Kiro. Any of the other providers in [section 1](#other-ai-providers-alternatives) work too.
@@ -270,7 +330,8 @@ The backend was closed (from another tab, the Close app button, or the black win
 | Red "AI not configured" badge | Fill in the missing setting it names in `.env`, then restart the app. |
 | "Kiro CLI not found" | Install the Kiro CLI (see setup) and open a **new** PowerShell to check `kiro-cli --version`. Then restart the app with `start.bat`. If it is still not found, run `(Get-Command kiro-cli).Source` in PowerShell and put that path in `.env` as `KIRO_CLI_PATH=...`. |
 | Kiro CLI login or "API key required" error | Run `kiro-cli login` in PowerShell (check with `kiro-cli whoami`), or put a Kiro API key in `LLM_API_KEY` in `.env`. |
-| Section 2 shows "Could not connect to the financial database" | The database file is missing or malformed. Check that `financial_db_path` points to a valid CSV (default `intel_quarterly_ratios.csv`, see [section 5](#5-financial-database-csv-format) for the format), then create the deal again. |
+| Section 2 shows "Could not connect to the financial database" | Either the borrower is not one of the companies in the database (the message lists them; use **Edit** on the deal to correct the name), or the file is missing or malformed. Check that `FINANCIAL_DB_PATH` points to the workbook (default `Semiconductor_Financial_Performance_Indicators_Combined.xlsx`, see [section 5](#5-financial-database-format)), then click **Reconnect financial database**. |
+| The forecast says it needs values from the database | The deal was created on the old CSV database. Click **Reconnect financial database** in Section 2C. |
 | A section "failed" | Expand **Last run failed** to see why. Earlier results are kept, so you can simply run it again. |
 | "No relevant pages were found" | The PDF may be scanned (no text), or may not cover that topic. Upload a text-based PDF. |
 | Section 4 or 5 button is greyed out | Approve Section 3 first (for Section 4), or complete Section 4 (for Section 5). |
@@ -281,6 +342,6 @@ The backend was closed (from another tab, the Close app button, or the black win
 ## 8. For developers
 
 - **Prompts:** the AI prompts live in `Instructions.md` (Parts 5 and 6). After editing a prompt, run `.venv\Scripts\python tools\sync_prompts.py` to update the copies the app loads from `backend\app\prompts\`.
-- **Thresholds and keywords:** large-swing and stable-band thresholds, page-selection keywords and size limits are set in `config/analysis.toml`. The PDF upload limit is `max_upload_mb` (default 200 MB) and the CSV limit is `max_csv_mb`.
+- **Thresholds and keywords:** large-swing and stable-band thresholds, page-selection keywords, size limits and the forecast defaults (`[forecast]`: default facility rate, horizon, upside and downside shocks) are set in `config/analysis.toml`. The PDF upload limit is `max_upload_mb` (default 200 MB) and the CSV limit is `max_csv_mb`.
 - **Tests:** run `.venv\Scripts\python -m pytest`. The tests use a simulated AI, so they need no API key or internet connection.
 - **Code layout:** the backend (Python/FastAPI) is in `backend/app/` and the frontend (HTML/CSS/JavaScript) is in `frontend/`. `Instructions.md` Part 4.6 describes each file.

@@ -4,8 +4,10 @@ from __future__ import annotations
 import re
 
 from . import documents as docs
-from .financial import CANONICAL_LABEL, NOT_IN_DB, PANELS
+from . import forecast as fcast
+from .financial import CANONICAL_LABEL, MEMO_KEYS, NOT_IN_DB, PANELS
 from .llm import TaskSpec, run_llm_task
+from .settings import get_settings
 from .schemas import (BUSINESS_FIELDS, CALIBRATION, DEBT_FIELDS, MEMO_OUTLINE, PANEL_KEYS, PLACEHOLDER,
                       REPAYMENT_DIMENSIONS)
 from .storage import AppError, Repo, deal_lock, now_iso
@@ -29,15 +31,27 @@ def load_context(repo: Repo, deal: dict) -> dict:
     dataset = repo.read(deal_id, "financial/dataset.json")
     csv_ev = repo.read(deal_id, "financial/csv_evidence.json", {})
     doc_ev = repo.read(deal_id, "evidence.json", {})
+    # The forecast is recomputed from the stored dataset and the saved (or default) assumptions, so its
+    # Evidence IDs always match what the dashboard shows. Saving new assumptions marks Section 3 onward stale.
+    fc = fcast.for_deal(repo, deal, get_settings(), dataset) if dataset else {"available": False, "evidence": {}}
     return {
         "dataset": dataset,
         "csv": csv_ev,
         "evidence": doc_ev,
+        "forecast": fc["evidence"],
+        "forecast_state": fc,
         "intake": deal["intake"],
         "comparisons": dataset["comparisons"] if dataset else [],
         "unavailable": dataset["unavailable_metrics"] if dataset else [],
-        "known": set(csv_ev) | set(doc_ev) | set(deal["intake"]),
+        "known": set(csv_ev) | set(doc_ev) | set(deal["intake"]) | set(fc["evidence"]),
     }
+
+
+FORECAST_PREFIXES = ("FC-", "FA-", "FT-")
+
+
+def cites_forecast(refs: list[str]) -> bool:
+    return any(r.startswith(FORECAST_PREFIXES) for r in refs)
 
 
 def _audit(repo: Repo, deal_id: str):
@@ -50,14 +64,32 @@ def _items_for_scope(ctx: dict, scope: str) -> list[dict]:
 
 
 def _dataset_payload(dataset: dict) -> dict:
-    return {
+    out = {
         "file_name": dataset["file_name"],
         "periods": [p["label"] for p in dataset["periods"]],
         "metrics": [{"metric_key": m["key"], "label": m["label"], "unit": m["unit_type"],
+                     **({"unit_label": m["unit_label"]} if m.get("unit_label") else {}),
+                     **({"basis": m["basis"]} if m.get("basis") else {}),
                      "values": [{"period": e["period"], "display": e["display"], "evidence_id": e["evidence_id"], "flags": e["flags"]}
                                 for e in m["entries"]]}
                     for m in dataset["metrics"] if m["recognised"]],
     }
+    if dataset.get("company"):
+        out.update({"company": dataset["company"], "currency_unit": dataset.get("currency_unit"),
+                    "period_calendar": {p["label"]: p.get("calendar_quarter") for p in dataset["periods"]}})
+    return out
+
+
+def _divergence_payload(dataset: dict) -> list[dict]:
+    out = []
+    for d in dataset["divergence"]:
+        rec = {"pattern_id": d["pattern_id"], "description": d["description"],
+               "status": "assessable" if d["assessable"] else "not assessable"}
+        if d["assessable"]:
+            rec["observed"] = [{"from_period": o["from_period"], "to_period": o["to_period"], "evidence_ids": o["evidence_ids"],
+                                "changes": o["changes"]} for o in d.get("observed", [])]
+        out.append(rec)
+    return out
 
 
 def _comparisons_payload(dataset: dict) -> list[dict]:
@@ -235,10 +267,12 @@ def _all_s3(out: dict) -> list[tuple[str, dict]]:
         for kind in ("supports", "weakens"):
             for i, s in enumerate(r[kind]):
                 pairs.append((f"repayment:{r['dimension']}:{kind}#{i + 1}", s))
+    for i, s in enumerate(out.get("forecast", [])):
+        pairs.append((f"forecast#{i + 1}", s))
     return pairs
 
 
-def s3_rules(out: dict, present_keys: set[str]) -> list[str]:
+def s3_rules(out: dict, present_keys: set[str], forecast_available: bool = False) -> list[str]:
     errs = []
     if [p["panel"] for p in out["panels"]] != PANEL_KEYS:
         errs.append(f"panels must be exactly, in order: {PANEL_KEYS}")
@@ -248,19 +282,34 @@ def s3_rules(out: dict, present_keys: set[str]) -> list[str]:
     for p in out["panels"]:
         cited = {r for s in p["statements"] for r in s["refs"]}
         for mk in panel_metrics.get(p["panel"], []):
-            if mk in present_keys and not any(r.startswith(f"CSV-{mk}-") for r in cited):
+            if mk in present_keys and mk not in MEMO_KEYS and not any(r.startswith(f"CSV-{mk}-") for r in cited):
                 errs.append(f"panel {p['panel']} must comment on {mk} and cite its CSV Evidence_IDs")
     for owner, s in _all_s3(out):
         csv_refs = [r for r in s["refs"] if r.startswith("CSV-")]
         ev_refs = [r for r in s["refs"] if r.startswith("EV-")]
+        fc = cites_forecast(s["refs"])
         if s["label"] == "Sourced" and owner.startswith(("panel", "cross")) and not csv_refs:
             errs.append(f"{owner}: a Sourced trend statement must cite the CSV Evidence_ID of every period it references")
         if s["label"] == "Sourced" and not s["refs"]:
             errs.append(f"{owner}: Sourced statements must cite at least one Evidence_ID")
-        if s["label"] == "ASSUMPTION" and not ev_refs:
-            errs.append(f"{owner}: an ASSUMPTION (possible explanation) must cite at least one EV- Evidence_ID")
+        if s["label"] == "ASSUMPTION" and not ev_refs and not fc:
+            errs.append(f"{owner}: an ASSUMPTION must cite at least one EV- Evidence_ID (possible explanation) or FC-/FA- Evidence_ID (forecast)")
+        if fc and s["label"] != "ASSUMPTION":
+            errs.append(f"{owner}: a statement citing forecast Evidence_IDs (FC-, FA-, FT-) must be labelled ASSUMPTION")
         if has_decision_language(s["text"]):
             errs.append(f"{owner}: no lending recommendation or credit decision language is allowed")
+    fstmts = out.get("forecast", [])
+    if forecast_available:
+        if len(fstmts) < 3:
+            errs.append("forecast: give at least 3 statements covering the base, upside and downside scenarios")
+        for scen in ("BASE", "UPSIDE", "DOWNSIDE"):
+            if not any(r.startswith((f"FC-{scen}-", f"FA-{scen}-")) for s in fstmts for r in s["refs"]):
+                errs.append(f"forecast: cite at least one FC-{scen}- Evidence_ID for the {scen.lower()} scenario")
+        for i, s in enumerate(fstmts, start=1):
+            if not cites_forecast(s["refs"]):
+                errs.append(f"forecast#{i}: cite the FC- (and FA-) Evidence_IDs of the forecast values quoted")
+    elif fstmts:
+        errs.append("forecast must be an empty list: no forecast was supplied")
     return errs
 
 
@@ -285,12 +334,13 @@ def run_section3(repo: Repo, prompts, settings, deal_id: str) -> dict:
         "comparison_records": _comparisons_payload(ds),
         "sustained_trends": {k: v for k, v in ds["sustained"].items() if v},
         "unavailable_metrics": _unavailable_payload(ds),
-        "divergence_patterns": [{"pattern_id": d["pattern_id"], "description": d["description"],
-                                 "status": "assessable" if d["assessable"] else "not assessable"} for d in ds["divergence"]],
+        "divergence_patterns": _divergence_payload(ds),
         "panels": [{"panel": k, "title": t, "metrics": m} for k, t, m, _ in PANELS],
         "repayment_dimensions": REPAYMENT_DIMENSIONS,
+        "forecast": fcast.ai_payload(ctx["forecast_state"]),
     }
-    spec = TaskSpec("S3", rules=lambda o: s3_rules(o, present), refs=lambda o: [(own, r) for own, s in _all_s3(o) for r in s["refs"]])
+    fc_ok = bool(payload["forecast"])
+    spec = TaskSpec("S3", rules=lambda o: s3_rules(o, present, fc_ok), refs=lambda o: [(own, r) for own, s in _all_s3(o) for r in s["refs"]])
     res = run_llm_task(spec, payload, prompts, settings, ctx["known"], _audit(repo, deal_id))
     if not res["ok"]:
         _fail(repo, deal_id, "s3", "Section 3 financial trend analysis", res["errors"])
@@ -301,14 +351,19 @@ def run_section3(repo: Repo, prompts, settings, deal_id: str) -> dict:
         statements.append({"id": f"S3-{n}", "group": group, "text": s["text"], "original_text": s["text"], "label": s["label"],
                            "refs": s["refs"], "claims": s["claims"], "verification": v, "status": "Pending", "comments": []})
     divergences = [{"pattern_id": d["pattern_id"], "description": d["description"],
-                    "result": "Assessable" if d["assessable"] else "Not assessable: data not available in database",
-                    "missing_metrics": d["missing_metrics"]} for d in ds["divergence"]]
+                    "result": d.get("statement") or ("Assessable" if d["assessable"] else "Not assessable: data not available in database"),
+                    "observed": d.get("observed", []), "missing_metrics": d["missing_metrics"]} for d in ds["divergence"]]
     with deal_lock(deal_id):
+        if fc_ok:
+            fs = ctx["forecast_state"]
+            repo.append_audit(deal_id, {"type": "forecast_used", "section": "s3", "analyst_name": "System",
+                                        "forecast_status": fs["status"], "assumptions": fs["assumptions"]})
         repo.append_audit(deal_id, {"type": "number_check", "section": "s3",
                                     "results": [{"statement_id": s["id"], "mark": s["verification"]["mark"],
                                                  "unmatched": s["verification"]["unmatched"]} for s in statements]})
         repo.write(deal_id, "s3.json", {"statements": statements, "divergences": divergences, "approved": False,
-                                        "approval": None, "generated_at": now_iso()})
+                                        "approval": None, "generated_at": now_iso(),
+                                        "forecast_status": ctx["forecast_state"].get("status") if fc_ok else None})
         _finish(repo, deal_id, "s3")
     return repo.read(deal_id, "s3.json")
 
@@ -367,6 +422,7 @@ def run_section4(repo: Repo, prompts, settings, deal_id: str) -> dict:
         "financial_dataset": _dataset_payload(ds),
         "comparison_records": _comparisons_payload(ds),
         "unavailable_metrics": _unavailable_payload(ds),
+        "forecast": fcast.ai_payload(ctx["forecast_state"]),
     }
     res = run_llm_task(TaskSpec("S4", rules=s4_rules, refs=_s4_refs), payload, prompts, settings, ctx["known"], _audit(repo, deal_id))
     if not res["ok"]:
@@ -399,6 +455,8 @@ def s5_rules(out: dict) -> list[str]:
                     errs.append(f"{tag}: the placeholder statement must be labelled NOT VERIFIED")
                 if st["label"] == "Sourced" and not st["refs"]:
                     errs.append(f"{tag}: every Sourced statement must cite at least one Evidence_ID")
+                if cites_forecast(st["refs"]) and st["label"] != "ASSUMPTION":
+                    errs.append(f"{tag}: a statement citing forecast Evidence_IDs (FC-, FA-, FT-) must be labelled ASSUMPTION")
                 if has_decision_language(st["text"]):
                     errs.append(f"{tag}: the memo must not recommend approval or decline or state a credit decision")
     return errs
@@ -476,12 +534,15 @@ def run_section5(repo: Repo, prompts, settings, deal_id: str) -> dict:
         "comparison_records": _comparisons_payload(ds),
         "unavailable_metrics": _unavailable_payload(ds),
         "information_gaps": ds["information_gaps"],
+        "forecast": fcast.ai_payload(ctx["forecast_state"]),
     }
     res = run_llm_task(TaskSpec("S5", rules=s5_rules, refs=_s5_refs, soft_unknown_refs=True), payload, prompts, settings,
                        ctx["known"], _audit(repo, deal_id))
     if not res["ok"]:
         _fail(repo, deal_id, "s5", "Section 5 credit memo", res["errors"])
     missing_gaps, anomaly_gaps = _gap_statements(ds, s3, s4)
+    fc_state = ctx["forecast_state"]
+    fc_summaries = _forecast_statements(fc_state) if fc_state.get("available") else []
     verified_csv = {r for s in s3["statements"] if s["status"] == "Approved" and s["verification"]["mark"] == "Numbers verified"
                     for r in s["refs"] if r.startswith("CSV-")}
     approved_ev = {k for k, e in ctx["evidence"].items() if e.get("status") == "Approved"}
@@ -491,9 +552,16 @@ def run_section5(repo: Repo, prompts, settings, deal_id: str) -> dict:
         for ss in sec["subsections"]:
             items = [{**st, "source": "ai"} for st in ss["statements"]]
             extra = []
-            if ss["key"] == "dscr_and_debt_servicing" and not any("pro-forma" in st["text"].lower() or "pro forma" in st["text"].lower() for st in items):
-                extra.append({"text": "Pro-forma debt service including the requested facility has not been assessed and must be assessed by the analyst.",
-                              "label": "NOT VERIFIED", "refs": [], "source": "backend"})
+            ai_cites_fc = any(cites_forecast(st["refs"]) for st in items)
+            if ss["key"] == "dscr_and_debt_servicing":
+                if not fc_state.get("available"):
+                    if not any("pro-forma" in st["text"].lower() or "pro forma" in st["text"].lower() for st in items):
+                        extra.append({"text": "Pro-forma debt service including the requested facility has not been assessed and must be assessed by the analyst.",
+                                      "label": "NOT VERIFIED", "refs": [], "source": "backend"})
+                elif not ai_cites_fc:
+                    extra.append({**_proforma_statement(fc_state), "source": "backend"})
+            if ss["key"] == "forecast_and_scenarios" and fc_summaries and not ai_cites_fc:
+                extra += [{**st, "source": "backend"} for st in fc_summaries]
             if ss["key"] == "missing_information":
                 extra += [{**g, "source": "backend"} for g in missing_gaps]
             if ss["key"] == "conflicting_information":
@@ -525,6 +593,47 @@ def run_section5(repo: Repo, prompts, settings, deal_id: str) -> dict:
     return repo.read(deal_id, "s5.json")
 
 
+def _forecast_statements(fc: dict) -> list[dict]:
+    """Backend-generated scenario summaries (never AI-written), quoting forecast values with their FC- IDs."""
+    out = []
+    unit = fc.get("currency_unit") or ""
+    for s in fc["scenarios"].values():
+        sm = s["summary"]
+        key = s["key"].upper()
+        parts, refs = [], []
+        if sm["min_dscr"]:
+            parts.append(f"the lowest DSCR is {sm['min_dscr']['display']} in {sm['min_dscr']['period']}")
+            refs.append(sm["min_dscr"]["evidence_id"])
+        if sm["min_interest_coverage"]:
+            parts.append(f"the lowest interest coverage is {sm['min_interest_coverage']['display']} in {sm['min_interest_coverage']['period']}")
+            refs.append(sm["min_interest_coverage"]["evidence_id"])
+        fcash = sm["final_cash"]
+        parts.append(f"cash after debt service is {fcash['display']} {unit} in {fcash['period']}".replace("  ", " "))
+        refs.append(fcash["evidence_id"])
+        n_short, n_all = len(sm["shortfall_quarters"]), len(fc["periods"])
+        cover = ("Cash flow available for debt service is below debt service in every forecast quarter." if n_short == n_all
+                 else f"Cash flow available for debt service is below debt service in some forecast quarters (first: {sm['shortfall_quarters'][0]})."
+                 if n_short else "Cash flow available for debt service covers debt service in every forecast quarter.")
+        joined = parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} and {parts[-1]}"
+        out.append({"text": f"{s['label']} (backend projection from the stated assumptions): {joined}. {cover}",
+                    "label": "ASSUMPTION", "refs": refs + [f"FA-{key}-{p.upper()}" for p, _ in fcast.PARAMS]})
+        hits = [b for b in fc["breaches"] if b["scenario"] == s["key"]]
+        if hits:
+            b = hits[0]
+            out.append({"text": f"{s['label']}: the analyst threshold {b['threshold_label']} of {b['threshold_display']} is breached, first by "
+                                f"{b['metric_label']} of {b['display']} in {b['period']}.",
+                        "label": "ASSUMPTION", "refs": [b["evidence_id"], b["threshold_id"]]})
+    return out
+
+
+def _proforma_statement(fc: dict) -> dict:
+    base = fc["scenarios"]["base"]["series"]
+    ds_, cf = base["DEBT_SERVICE"][0], base["CFADS"][0]
+    return {"text": f"Base case pro-forma debt service including the requested facility is {ds_['display']} in {ds_['period']}, "
+                    f"against cash flow available for debt service of {cf['display']} (backend projection from the stated assumptions).",
+            "label": "ASSUMPTION", "refs": [ds_["evidence_id"], cf["evidence_id"], "FA-FACILITY_AMOUNT"]}
+
+
 def _memo_statement(sid, number, titles, key, st, ctx, verified_csv, approved_ev) -> dict:
     v = verify_statement(st, ctx, "S5")
     status, note, carried_over = "Pending", None, False
@@ -554,9 +663,21 @@ def evidence_snapshot(ctx: dict, refs: list[str]) -> list[dict]:
             out.append({"evidence_id": r, "metric_label": e["metric_label_as_written"], "column_header": e["column_header"], "display": e["display"]})
         elif r in ctx["intake"]:
             out.append({"evidence_id": r, "value": ctx["intake"][r]["display"]})
+        elif r in ctx.get("forecast", {}):
+            e = ctx["forecast"][r]
+            out.append({"evidence_id": r, "forecast": describe_forecast_ref(e)})
         else:
             out.append({"evidence_id": r, "unknown": True})
     return out
+
+
+def describe_forecast_ref(e: dict) -> str:
+    if e["type"] == "forecast":
+        unit = f" {e['unit_label']}" if e.get("unit_label") else ""
+        return f"Backend forecast, {e['scenario_label']}: {e['metric_label']}, {e['period']} = {e['display']}{unit}"
+    if e["type"] == "forecast_assumption":
+        return f"Forecast assumption{', ' + e['scenario_label'] if e.get('scenario_label') else ''}: {e['label']} = {e['display']} ({e['source']})"
+    return f"Analyst threshold: {e['label']} = {e['display']}"
 
 
 # --------------------------------------------------------------------------- Section 6 support check

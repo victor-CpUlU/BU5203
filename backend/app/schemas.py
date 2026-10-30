@@ -36,7 +36,8 @@ MEMO_OUTLINE = [
     (3, "Financial Analysis", [("revenue_and_profitability", "Revenue and profitability"), ("cash_flow_and_liquidity", "Cash flow and liquidity"),
                                ("leverage_and_historical_trends", "Leverage and historical trends")]),
     (4, "Repayment Capacity", [("cash_generation", "Cash generation"), ("dscr_and_debt_servicing", "DSCR and debt-servicing capacity"),
-                               ("existing_debt_obligations", "Existing debt obligations")]),
+                               ("existing_debt_obligations", "Existing debt obligations"),
+                               ("forecast_and_scenarios", "Forecast and scenario analysis")]),
     (5, "Key Credit Risks", [("financial_risks", "Financial"), ("business_operational_risks", "Business and operational"),
                              ("industry_external_risks", "Industry and external")]),
     (6, "Risk Mitigants / Proposed Loan Structure", [("suggested_covenants", "Suggested covenants"), ("collateral_and_security", "Collateral and security"),
@@ -116,6 +117,7 @@ class S3Output(Strict):
     panels: list[S3Panel]
     cross_metric: list[S3Statement] = []
     repayment_capacity: list[S3Repayment]
+    forecast: list[S3Statement] = []
 
 
 # --------------------------------------------------------------------------- Section 4

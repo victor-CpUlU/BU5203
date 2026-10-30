@@ -14,7 +14,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from .schemas import MEMO_OUTLINE
-from .sections import load_context
+from .sections import describe_forecast_ref, load_context
 from .storage import AppError, Repo
 
 MEMO_HEADER = "AI-generated draft reviewed by the analyst. Not a credit decision."
@@ -77,13 +77,15 @@ class CiteLedger:
                 out.append((n, "Document", f"{r} \u2014 {desc}"))
             elif r in self.ctx["csv"]:
                 e = self.ctx["csv"][r]
-                desc = f"Financial database ({e['file_name']}): {e['metric_label_as_written']}, {e['column_header']} = {e['display']}"
+                desc = f"Financial database ({e['file_name']}{', cell ' + e['cell'] if e.get('cell') else ''}): {e['metric_label_as_written']}, {e['column_header']} = {e['display']}{' ' + e['unit_label'] if e.get('unit_label') else ''}"
                 if e.get("flags"):
                     desc += f" [flags: {', '.join(e['flags'])}]"
                 out.append((n, "Financial database", f"{r} \u2014 {desc}"))
             elif r in self.ctx["intake"]:
                 e = self.ctx["intake"][r]
                 out.append((n, "Deal intake", f"{r} \u2014 Deal intake: {e['label']} = {e['display']}"))
+            elif r in self.ctx.get("forecast", {}):
+                out.append((n, "Forecast", f"{r} \u2014 {describe_forecast_ref(self.ctx['forecast'][r])}"))
             else:
                 out.append((n, "Unresolved", f"{r} \u2014 reference does not exist"))
         return out
@@ -242,8 +244,19 @@ def audit_pdf(repo: Repo, deal_id: str) -> Path:
               _table([["doc_id", "Name", "Type", "Period", "Audited", "Pages"]] +
                      [[d["doc_id"], d["display_name"], d["doc_type"], d["period_covered"], "Yes" if d["audited"] else "No", d["page_count"]]
                       for d in deal["documents"]], [14 * mm, 62 * mm, 30 * mm, 26 * mm, 18 * mm, 14 * mm]),
-              Paragraph(escape(f"Financial database: {ctx['dataset']['file_name'] if ctx['dataset'] else 'not loaded'}"), BODY),
-              Paragraph("Section 3 financial analysis review", H2)]
+              Paragraph(escape(f"Financial database: {ctx['dataset']['file_name'] if ctx['dataset'] else 'not loaded'}"
+                               + (f" (sheet {ctx['dataset']['sheet']}). {ctx['dataset'].get('calculation_note', '')}" if ctx["dataset"] and ctx["dataset"].get("sheet") else "")), BODY)]
+    fs = ctx.get("forecast_state") or {}
+    if fs.get("available"):
+        st = fs["status"]
+        state = (f"Saved by {st.get('saved_by')} at {st.get('saved_at')}" if st["state"] == "saved"
+                 else "Historical-average defaults (not saved by the analyst)")
+        story += [Paragraph("Forecast and scenario assumptions (backend model)", H2), Paragraph(escape(state), BODY),
+                  _table([["Evidence ID", "Assumption", "Value", "Source"]] +
+                         [[i, (e["scenario_label"] + ": " if e.get("scenario_label") else "") + e["label"], e["display"], e["source"]]
+                          for i, e in fs["evidence"].items() if e["type"] in ("forecast_assumption", "forecast_threshold")],
+                         [40 * mm, 60 * mm, 30 * mm, 44 * mm])]
+    story.append(Paragraph("Section 3 financial analysis review", H2))
     approval = next((a for a in reversed(audit) if a.get("type") == "s3_approval"), None)
     story.append(Paragraph(escape(f"Approval: {approval['analyst_name']} at {approval['timestamp']}" if approval else "Approval: not recorded"), BODY))
     for s in s3["statements"]:
@@ -277,6 +290,8 @@ def audit_pdf(repo: Repo, deal_id: str) -> Path:
                                 + (f" | flags: {', '.join(e['flags'])}" if e["flags"] else "")])
             elif r in ctx["intake"]:
                 rows.append([r, f"Deal intake: {ctx['intake'][r]['display']}"])
+            elif r in ctx.get("forecast", {}):
+                rows.append([r, describe_forecast_ref(ctx["forecast"][r])])
             else:
                 rows.append([r, "Reference does not exist"])
         story += [_table(rows, [32 * mm, 142 * mm]), Spacer(1, 5)]

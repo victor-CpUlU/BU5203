@@ -18,6 +18,27 @@ multiple = 0.10
 days = 3.0
 amount = 5.0
 
+[forecast]               # backend forecast and scenario analysis (Section 3). All values are illustrative starting points;
+                         # the analyst edits every assumption per deal in the dashboard.
+facility_rate = 6.0                     # default interest rate on the requested facility, % per year
+default_horizon_quarters = 8            # used when the tenor cannot be read from the deal intake
+max_horizon_quarters = 20               # longest forecast the dashboard allows
+short_term_debt_repayment_quarters = 4  # existing short-term debt is repaid evenly over this many quarters
+
+[forecast.upside]        # added to the base case (percentage points; interest_change is a % change)
+revenue_growth = 2.0
+ebitda_margin = 2.0
+capex_pct_revenue = -1.0
+interest_change = -10.0
+facility_rate = -0.5
+
+[forecast.downside]
+revenue_growth = -5.0
+ebitda_margin = -5.0
+capex_pct_revenue = 2.0
+interest_change = 25.0
+facility_rate = 2.0
+
 [keywords]
 business = [
   "item 1. business", "business overview", "our business", "business model", "segment", "segments",

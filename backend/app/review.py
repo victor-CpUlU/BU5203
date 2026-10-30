@@ -4,7 +4,7 @@ from __future__ import annotations
 import base64
 
 from . import documents as docs
-from .sections import evidence_snapshot, load_context
+from .sections import describe_forecast_ref, evidence_snapshot, load_context
 from .storage import AppError, Repo, deal_lock, now_iso
 from .verification import verify_statement
 
@@ -260,10 +260,21 @@ def evidence_lookup(repo: Repo, deal_id: str, ev_id: str, statement_id: str | No
         e = ctx["csv"][ev_id]
         return {"type": "csv", "evidence_id": ev_id, "file_name": e["file_name"], "metric_label": e["metric_label_as_written"],
                 "column_header": e["column_header"], "period": e["period"], "display": e["display"],
-                "flags": e["flags"] or ["None"]}
+                "flags": e["flags"] or ["None"], "sheet": e.get("sheet"), "cell": e.get("cell"), "formula": e.get("formula"),
+                "unit_label": e.get("unit_label"), "basis": e.get("basis")}
     if ev_id in ctx["intake"]:
         e = ctx["intake"][ev_id]
         return {"type": "deal_intake", "evidence_id": ev_id, "label": e["label"], "value": e["display"]}
+    if ev_id in ctx["forecast"]:
+        e = ctx["forecast"][ev_id]
+        fs = ctx["forecast_state"]["status"]
+        out = {"type": e["type"], "evidence_id": ev_id, "description": describe_forecast_ref(e), **e,
+               "assumptions_status": fs}
+        if e["type"] == "forecast":
+            out["assumptions"] = [{"evidence_id": i, "label": a["label"], "display": a["display"], "source": a["source"]}
+                                  for i, a in ctx["forecast"].items() if a["type"] == "forecast_assumption"
+                                  and a.get("scenario") in (e["scenario"], None)]
+        return out
     e = ctx["evidence"].get(ev_id)
     if e is None:
         raise AppError(404, "evidence_not_found", f"Evidence {ev_id} does not exist for this deal.")

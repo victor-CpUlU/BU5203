@@ -13,6 +13,35 @@ UNIT_TYPES = ("percent", "multiple", "days", "amount")
 
 DEFAULT_LARGE_SWING = {"percent": 10.0, "multiple": 2.0, "days": 5.0, "amount": 50.0}
 DEFAULT_STABLE_BAND = {"percent": 1.0, "multiple": 0.10, "days": 3.0, "amount": 5.0}
+DEFAULT_DB = "Semiconductor_Financial_Performance_Indicators_Combined.xlsx"
+FORECAST_PARAMS = ("revenue_growth", "ebitda_margin", "capex_pct_revenue", "interest_change", "facility_rate")
+# Illustrative scenario shocks applied to the base case (percentage points, except interest_change in %).
+DEFAULT_FORECAST = {
+    "facility_rate": 6.0,          # % per year; the analyst sets the actual rate
+    "default_horizon_quarters": 8,
+    "max_horizon_quarters": 20,
+    "short_term_debt_repayment_quarters": 4,
+    "upside": {"revenue_growth": 2.0, "ebitda_margin": 2.0, "capex_pct_revenue": -1.0, "interest_change": -10.0, "facility_rate": -0.5},
+    "downside": {"revenue_growth": -5.0, "ebitda_margin": -5.0, "capex_pct_revenue": 2.0, "interest_change": 25.0, "facility_rate": 2.0},
+}
+
+
+def resolve_forecast(raw: dict | None) -> dict:
+    raw = raw or {}
+    out = {k: (dict(v) if isinstance(v, dict) else v) for k, v in DEFAULT_FORECAST.items()}
+    for k in ("facility_rate", "default_horizon_quarters", "max_horizon_quarters", "short_term_debt_repayment_quarters"):
+        v = raw.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+            out[k] = v
+    for scen in ("upside", "downside"):
+        for p in FORECAST_PARAMS:
+            v = (raw.get(scen) or {}).get(p)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                out[scen][p] = float(v)
+    out["max_horizon_quarters"] = int(min(40, max(4, out["max_horizon_quarters"])))
+    out["default_horizon_quarters"] = int(min(out["max_horizon_quarters"], max(4, out["default_horizon_quarters"])))
+    out["short_term_debt_repayment_quarters"] = int(max(1, out["short_term_debt_repayment_quarters"]))
+    return out
 
 # Test hooks: tests point these at temporary folders.
 _overrides: dict[str, object] = {}
@@ -65,7 +94,7 @@ class Settings:
     kiro_cli_path: str = "kiro-cli"
     support_check_enabled: bool = False
     port: int = 8000
-    financial_db_path: Path = PROJECT_ROOT / "intel_quarterly_ratios.csv"
+    financial_db_path: Path = PROJECT_ROOT / DEFAULT_DB
     data_dir: Path = PROJECT_ROOT / "data"
     prompts_dir: Path = PROJECT_ROOT / "backend" / "app" / "prompts"
     max_upload_mb: float = 50
@@ -78,6 +107,7 @@ class Settings:
     defaults_applied: list[str] = field(default_factory=list)
     keywords_business: list[str] = field(default_factory=list)
     keywords_debt: list[str] = field(default_factory=list)
+    forecast: dict = field(default_factory=lambda: resolve_forecast(None))
 
     def secrets(self) -> list[str]:
         return [self.llm_api_key] if self.llm_api_key else []
@@ -121,7 +151,7 @@ def get_settings() -> Settings:
     except ValueError:
         s.port = 8000
     db = env.get("FINANCIAL_DB_PATH", "").strip()
-    s.financial_db_path = (PROJECT_ROOT / db) if db and not Path(db).is_absolute() else Path(db) if db else PROJECT_ROOT / "intel_quarterly_ratios.csv"
+    s.financial_db_path = (PROJECT_ROOT / db) if db and not Path(db).is_absolute() else Path(db) if db else PROJECT_ROOT / DEFAULT_DB
     s.data_dir = Path(_overrides.get("data_dir", PROJECT_ROOT / "data"))
     s.prompts_dir = Path(_overrides.get("prompts_dir", s.prompts_dir))
     s.max_upload_mb = float(cfg.get("max_upload_mb", 50))
@@ -135,4 +165,5 @@ def get_settings() -> Settings:
     kw = cfg.get("keywords", {})
     s.keywords_business = [k.lower() for k in kw.get("business", [])]
     s.keywords_debt = [k.lower() for k in kw.get("debt", [])]
+    s.forecast = resolve_forecast(cfg.get("forecast"))
     return s

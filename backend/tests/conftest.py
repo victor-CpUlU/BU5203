@@ -113,7 +113,12 @@ class SmartFakeLLM:
         panels = [{"panel": p["panel"], "statements": [stmt(k) for k in p["metrics"] if k in metrics]} for p in data["panels"]]
         nv = {"text": "No weakening evidence was identified in the inputs.", "label": "NOT VERIFIED", "refs": [], "claims": []}
         rep = [{"dimension": d, "supports": [stmt("DSCR")], "weakens": [nv]} for d in data["repayment_dimensions"]]
-        return {"panels": panels, "cross_metric": [], "repayment_capacity": rep}
+        forecast = []
+        for sc in (data.get("forecast") or {}).get("scenarios", []):
+            v = next(m for m in sc["metrics"] if m["metric_key"] == "DSCR")["values"][0]
+            forecast.append({"text": f"In the {sc['label']}, the projected DSCR is {v['display']} (backend projection).",
+                             "label": "ASSUMPTION", "refs": [v["evidence_id"]], "claims": []})
+        return {"panels": panels, "cross_metric": [], "repayment_capacity": rep, "forecast": forecast}
 
     @staticmethod
     def _s4(data):
