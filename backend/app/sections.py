@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 from . import documents as docs
 from . import forecast as fcast
@@ -258,12 +259,12 @@ def _detect_conflicts(fields: dict, evidence: dict) -> None:
 # --------------------------------------------------------------------------- Section 3
 def _all_s3(out: dict) -> list[tuple[str, dict]]:
     pairs = []
-    for p in out["panels"]:
+    for p in out.get("panels", []):
         for i, s in enumerate(p["statements"]):
             pairs.append((f"panel:{p['panel']}#{i + 1}", s))
     for i, s in enumerate(out.get("cross_metric", [])):
         pairs.append((f"cross#{i + 1}", s))
-    for r in out["repayment_capacity"]:
+    for r in out.get("repayment_capacity", []):
         for kind in ("supports", "weakens"):
             for i, s in enumerate(r[kind]):
                 pairs.append((f"repayment:{r['dimension']}:{kind}#{i + 1}", s))
@@ -272,14 +273,16 @@ def _all_s3(out: dict) -> list[tuple[str, dict]]:
     return pairs
 
 
-def s3_rules(out: dict, present_keys: set[str], forecast_available: bool = False) -> list[str]:
+def s3_rules(out: dict, present_keys: set[str], forecast_available: bool = False, expected_panels: list[str] | None = None) -> list[str]:
+    """Rules for a full Section 3 output or for one part (one panel / repayment / forecast): only the keys present are checked."""
     errs = []
-    if [p["panel"] for p in out["panels"]] != PANEL_KEYS:
-        errs.append(f"panels must be exactly, in order: {PANEL_KEYS}")
-    if [r["dimension"] for r in out["repayment_capacity"]] != REPAYMENT_DIMENSIONS:
+    want = expected_panels or PANEL_KEYS
+    if "panels" in out and [p["panel"] for p in out["panels"]] != want:
+        errs.append(f"panels must be exactly, in order: {want}")
+    if "repayment_capacity" in out and [r["dimension"] for r in out["repayment_capacity"]] != REPAYMENT_DIMENSIONS:
         errs.append(f"repayment_capacity dimensions must be exactly, in order: {REPAYMENT_DIMENSIONS}")
     panel_metrics = {k: m for k, _, m, _ in PANELS}
-    for p in out["panels"]:
+    for p in out.get("panels", []):
         cited = {r for s in p["statements"] for r in s["refs"]}
         for mk in panel_metrics.get(p["panel"], []):
             if mk in present_keys and mk not in MEMO_KEYS and not any(r.startswith(f"CSV-{mk}-") for r in cited):
@@ -299,7 +302,9 @@ def s3_rules(out: dict, present_keys: set[str], forecast_available: bool = False
         if has_decision_language(s["text"]):
             errs.append(f"{owner}: no lending recommendation or credit decision language is allowed")
     fstmts = out.get("forecast", [])
-    if forecast_available:
+    if "forecast" not in out:
+        pass  # this part does not cover the forecast
+    elif forecast_available:
         if len(fstmts) < 3:
             errs.append("forecast: give at least 3 statements covering the base, upside and downside scenarios")
         for scen in ("BASE", "UPSIDE", "DOWNSIDE"):
@@ -311,6 +316,21 @@ def s3_rules(out: dict, present_keys: set[str], forecast_available: bool = False
     elif fstmts:
         errs.append("forecast must be an empty list: no forecast was supplied")
     return errs
+
+
+def _run_s3_parts(parts: dict, present: set[str], fc_ok: bool, prompts, settings, known: set[str], audit) -> dict:
+    """Run the Section 3 parts in parallel. Part names: "panel:<key>" (one dashboard panel), "repayment"
+    (cross-metric relationships and repayment capacity) and "forecast"."""
+    def one(part: str, payload: dict) -> dict:
+        kind = part.split(":")[0]
+        expected = [part.split(":", 1)[1]] if kind == "panel" else None
+        spec = TaskSpec("S3", schema_id=f"S3_{kind}", part=part, rules=lambda o: s3_rules(o, present, fc_ok, expected),
+                        refs=lambda o: [(own, r) for own, s in _all_s3(o) for r in s["refs"]])
+        return run_llm_task(spec, payload, prompts, settings, known, audit)
+
+    with ThreadPoolExecutor(max_workers=len(parts)) as pool:
+        futures = {part: pool.submit(one, part, payload) for part, payload in parts.items()}
+        return {part: f.result() for part, f in futures.items()}
 
 
 def run_section3(repo: Repo, prompts, settings, deal_id: str) -> dict:
@@ -326,7 +346,9 @@ def run_section3(repo: Repo, prompts, settings, deal_id: str) -> dict:
     ctx = load_context(repo, deal)
     ds = ctx["dataset"]
     present = {m["key"] for m in ds["metrics"] if m["recognised"] and any(e["value"] is not None for e in m["entries"])}
-    payload = {
+    forecast = fcast.ai_payload(ctx["forecast_state"])
+    fc_ok = bool(forecast)
+    history = {
         "deal_intake": intake_payload(deal),
         "business_information": _items_for_scope(ctx, "business"),
         "debt_and_financing": _items_for_scope(ctx, "debt"),
@@ -334,18 +356,34 @@ def run_section3(repo: Repo, prompts, settings, deal_id: str) -> dict:
         "comparison_records": _comparisons_payload(ds),
         "sustained_trends": {k: v for k, v in ds["sustained"].items() if v},
         "unavailable_metrics": _unavailable_payload(ds),
-        "divergence_patterns": _divergence_payload(ds),
-        "panels": [{"panel": k, "title": t, "metrics": m} for k, t, m, _ in PANELS],
-        "repayment_dimensions": REPAYMENT_DIMENSIONS,
-        "forecast": fcast.ai_payload(ctx["forecast_state"]),
     }
-    fc_ok = bool(payload["forecast"])
-    spec = TaskSpec("S3", rules=lambda o: s3_rules(o, present, fc_ok), refs=lambda o: [(own, r) for own, s in _all_s3(o) for r in s["refs"]])
-    res = run_llm_task(spec, payload, prompts, settings, ctx["known"], _audit(repo, deal_id))
-    if not res["ok"]:
-        _fail(repo, deal_id, "s3", "Section 3 financial trend analysis", res["errors"])
+    # Independent parts run in parallel (same prompt, each returns only its own keys): one per dashboard
+    # panel (only that panel's metrics are sent), one for cross-metric relationships and repayment capacity,
+    # and one for the forecast. The analysis takes about as long as the slowest part, and a part that fails
+    # a check is retried on its own.
+    parts = {}
+    for k, t, m, _ in PANELS:
+        keys = set(m)
+        dsp = _dataset_payload(ds)
+        dsp["metrics"] = [x for x in dsp["metrics"] if x["metric_key"] in keys]
+        parts[f"panel:{k}"] = {**history, "part": "panel", "financial_dataset": dsp,
+                               "comparison_records": [c for c in history["comparison_records"] if c["metric_key"] in keys],
+                               "sustained_trends": {x: v for x, v in history["sustained_trends"].items() if x in keys},
+                               "panels": [{"panel": k, "title": t, "metrics": m}]}
+    parts["repayment"] = {**history, "part": "repayment", "divergence_patterns": _divergence_payload(ds),
+                          "repayment_dimensions": REPAYMENT_DIMENSIONS}
+    if fc_ok:
+        parts["forecast"] = {"part": "forecast", "deal_intake": intake_payload(deal), "forecast": forecast}
+    results = _run_s3_parts(parts, present, fc_ok, prompts, settings, ctx["known"], _audit(repo, deal_id))
+    errors = [f"{part} part: {e}" for part, res in results.items() if not res["ok"] for e in res["errors"]]
+    if errors:
+        _fail(repo, deal_id, "s3", "Section 3 financial trend analysis", errors)
+    rep = results["repayment"]["output"]
+    output = {"panels": [results[f"panel:{k}"]["output"]["panels"][0] for k in PANEL_KEYS],
+              "cross_metric": rep.get("cross_metric", []), "repayment_capacity": rep["repayment_capacity"],
+              "forecast": results["forecast"]["output"]["forecast"] if fc_ok else []}
     statements = []
-    for n, (owner, s) in enumerate(_all_s3(res["output"]), start=1):
+    for n, (owner, s) in enumerate(_all_s3(output), start=1):
         group = owner.split("#")[0]
         v = verify_statement(s, ctx, "S3")
         statements.append({"id": f"S3-{n}", "group": group, "text": s["text"], "original_text": s["text"], "label": s["label"],

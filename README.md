@@ -228,7 +228,7 @@ You can re-run 2A or 2B on its own. Long filings take a few minutes because page
 The dashboard shows five panels: **Profitability, Leverage, Liquidity, Cash Flow and Debt Servicing**.
 
 - **Charts** use the database values exactly. A triangle marker means the value is flagged. Each panel has a **data table** (click to expand) and lists any metrics that are **not available in database**. Hover a metric name to see how the workbook defines it for this company (for example, DSCR is a proxy for some companies).
-- Click **Run AI financial analysis**. The AI commentary appears beside each chart. Python then checks each statement and marks it:
+- Click **Run AI financial analysis**. It takes about a minute: the app sends 7 requests to the AI at the same time. The AI commentary appears beside each chart. Python then checks each statement and marks it:
   - **Numbers verified**: every figure matches the cited data.
   - **Number mismatch**: something doesn't match. The unmatched values are listed.
 - The **Divergence patterns** table shows the five patterns from the Project Details and, for each, the quarters where Python observed it (for example Revenue up while Operating Cash Flow fell).
@@ -368,6 +368,7 @@ The backend was closed (from another tab, the Close app button, or the black win
 | Kiro CLI login or "API key required" error | Run `kiro-cli login` in PowerShell (check with `kiro-cli whoami`), or put a Kiro API key in `LLM_API_KEY` in `.env`. |
 | Section 2 shows "Could not connect to the financial database" | Either the borrower is not one of the companies in the database (the message lists them; use **Edit** on the deal to correct the name), or the file is missing or malformed. Check that `FINANCIAL_DB_PATH` points to the workbook (default `Semiconductor_Financial_Performance_Indicators_Combined.xlsx`, see [section 5](#5-financial-database-format)), then click **Reconnect financial database**. |
 | The forecast says it needs values from the database | The deal was created on the old CSV database. Click **Reconnect financial database** in Section 2C. |
+| "The Kiro CLI did not respond within ... seconds" | The AI took longer than `llm_timeout_s` in `config/analysis.toml` (default 600 seconds). Section 3 runs as 7 parallel AI requests (one per dashboard panel, one for repayment capacity, one for the forecast) and usually takes about 1 minute with the Kiro CLI. Section 5 sends a lot of data in one request and can take 2 to 3 minutes. Either takes longer if an AI answer fails a check and is retried. Run it again, or raise `llm_timeout_s`; the change applies on the next run without restarting. |
 | A section "failed" | Expand **Last run failed** to see why. Earlier results are kept, so you can simply run it again. |
 | "No relevant pages were found" | The PDF may be scanned (no text), or may not cover that topic. Upload a text-based PDF. |
 | Section 4 or 5 button is greyed out | Approve Section 3 first (for Section 4), or complete Section 4 (for Section 5). |

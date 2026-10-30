@@ -120,6 +120,20 @@ class S3Output(Strict):
     forecast: list[S3Statement] = []
 
 
+# Section 3 runs as three parallel AI calls with the same prompt; each part returns only its own keys.
+class S3PanelOutput(Strict):
+    panels: list[S3Panel] = Field(min_length=1, max_length=1)
+
+
+class S3RepaymentOutput(Strict):
+    cross_metric: list[S3Statement] = []
+    repayment_capacity: list[S3Repayment]
+
+
+class S3ForecastOutput(Strict):
+    forecast: list[S3Statement] = Field(min_length=1)
+
+
 # --------------------------------------------------------------------------- Section 4
 class S4Text(Strict):
     text: str
@@ -184,4 +198,5 @@ class S6Output(Strict):
     assessments: list[S6Assessment]
 
 
-SCHEMAS = {"S2A": S2AOutput, "S2B": S2BOutput, "S3": S3Output, "S4": S4Output, "S5": S5Output, "S6": S6Output}
+SCHEMAS = {"S2A": S2AOutput, "S2B": S2BOutput, "S3": S3Output, "S3_panel": S3PanelOutput, "S3_repayment": S3RepaymentOutput,
+           "S3_forecast": S3ForecastOutput, "S4": S4Output, "S5": S5Output, "S6": S6Output}

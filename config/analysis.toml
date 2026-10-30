@@ -3,7 +3,7 @@
 max_upload_mb = 200      # largest PDF accepted per upload (annual reports with images can exceed 50 MB)
 max_csv_mb = 5
 page_limit = 30          # pages per extraction request (1-200)
-llm_timeout_s = 120
+llm_timeout_s = 600      # seconds to wait for one AI response; Sections 3 and 5 can take over 2 minutes with the Kiro CLI
 llm_max_retries = 2
 
 [large_swing]            # change between adjacent periods that raises a "large swing" flag

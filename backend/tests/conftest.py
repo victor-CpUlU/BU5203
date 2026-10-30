@@ -99,6 +99,14 @@ class SmartFakeLLM:
 
     @staticmethod
     def _s3(data):
+        part = data.get("part")
+        if part == "forecast":
+            forecast = []
+            for sc in data["forecast"]["scenarios"]:
+                v = next(m for m in sc["metrics"] if m["metric_key"] == "DSCR")["values"][0]
+                forecast.append({"text": f"In the {sc['label']}, the projected DSCR is {v['display']} (backend projection).",
+                                 "label": "ASSUMPTION", "refs": [v["evidence_id"]], "claims": []})
+            return {"forecast": forecast}
         metrics = {m["metric_key"]: m for m in data["financial_dataset"]["metrics"]}
         comps = data["comparison_records"]
 
@@ -110,15 +118,10 @@ class SmartFakeLLM:
                     "label": "Sourced", "refs": [prev["evidence_id"], last["evidence_id"]],
                     "claims": [{"metric_key": key, "from_period": c["from_period"], "to_period": c["to_period"], "direction": c["direction"], "quoted_change": c["change"]}]}
 
-        panels = [{"panel": p["panel"], "statements": [stmt(k) for k in p["metrics"] if k in metrics]} for p in data["panels"]]
-        nv = {"text": "No weakening evidence was identified in the inputs.", "label": "NOT VERIFIED", "refs": [], "claims": []}
-        rep = [{"dimension": d, "supports": [stmt("DSCR")], "weakens": [nv]} for d in data["repayment_dimensions"]]
-        forecast = []
-        for sc in (data.get("forecast") or {}).get("scenarios", []):
-            v = next(m for m in sc["metrics"] if m["metric_key"] == "DSCR")["values"][0]
-            forecast.append({"text": f"In the {sc['label']}, the projected DSCR is {v['display']} (backend projection).",
-                             "label": "ASSUMPTION", "refs": [v["evidence_id"]], "claims": []})
-        return {"panels": panels, "cross_metric": [], "repayment_capacity": rep, "forecast": forecast}
+        if part == "repayment":
+            nv = {"text": "No weakening evidence was identified in the inputs.", "label": "NOT VERIFIED", "refs": [], "claims": []}
+            return {"repayment_capacity": [{"dimension": d, "supports": [stmt("DSCR")], "weakens": [nv]} for d in data["repayment_dimensions"]]}
+        return {"panels": [{"panel": p["panel"], "statements": [stmt(k) for k in p["metrics"] if k in metrics]} for p in data["panels"]]}
 
     @staticmethod
     def _s4(data):

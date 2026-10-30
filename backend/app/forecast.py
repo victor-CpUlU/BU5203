@@ -486,6 +486,35 @@ def for_deal(repo, deal: dict, settings, dataset: dict | None = None, assumption
             "evidence": build_evidence(ds, result, assumptions, sources)}
 
 
+def _key_periods(s: dict, periods: list[str]) -> list[str]:
+    """Quarters sent to the AI: first, last, and every quarter a summary figure refers to (lowest DSCR,
+    first shortfall, ...). The dashboard still shows every quarter; the AI only quotes what it receives."""
+    sm = s["summary"]
+    keep = {periods[0], periods[-1]}
+    for k in ("min_dscr", "min_interest_coverage", "max_debt_ebitda", "min_cash", "final_cash"):
+        if sm.get(k):
+            keep.add(sm[k]["period"])
+    if sm["shortfall_quarters"]:
+        keep.add(sm["shortfall_quarters"][0])
+    return [p for p in periods if p in keep]
+
+
+def _first_breaches(breaches: list[dict]) -> list[dict]:
+    """First breach per scenario and threshold, with how many forecast quarters breach it."""
+    out, seen = [], {}
+    for b in breaches:
+        key = (b["scenario"], b["threshold"])
+        if key in seen:
+            seen[key]["quarters_breached"] += 1
+            continue
+        rec = {k: b[k] for k in ("scenario", "metric_label", "period", "display", "evidence_id", "threshold_label",
+                                 "threshold_display", "threshold_id")}
+        rec["quarters_breached"] = 1
+        seen[key] = rec
+        out.append(rec)
+    return out
+
+
 def ai_payload(fc: dict) -> dict | None:
     """Compact forecast input for the AI sections: only backend values with their Evidence IDs."""
     if not fc or not fc.get("available"):
@@ -502,13 +531,13 @@ def ai_payload(fc: dict) -> dict | None:
         "assumptions": [{"evidence_id": i, "scenario": e["scenario"], "label": e["label"], "display": e["display"], "source": e["source"]}
                         for i, e in ev.items() if e["type"] == "forecast_assumption"],
         "analyst_thresholds": [{"evidence_id": i, "label": e["label"], "display": e["display"]} for i, e in ev.items() if e["type"] == "forecast_threshold"],
-        "scenarios": [{"scenario": s["key"], "label": s["label"],
+        "scenarios": [{"scenario": s["key"], "label": s["label"], "key_quarters": _key_periods(s, fc["periods"]),
                        "metrics": [{"metric_key": k, "label": METRIC_LABEL[k],
-                                    "values": [{"evidence_id": p["evidence_id"], "display": p["display"]} for p in s["series"][k]]}
+                                    "values": [{"evidence_id": p["evidence_id"], "display": p["display"]} for p in s["series"][k]
+                                               if p["period"] in _key_periods(s, fc["periods"])]}
                                    for k in AI_METRICS],
                        "summary": s["summary"]} for s in fc["scenarios"].values()],
-        "threshold_breaches": [{k: b[k] for k in ("scenario", "metric_label", "period", "display", "evidence_id", "threshold_label",
-                                                  "threshold_display", "threshold_id")} for b in fc["breaches"]],
+        "threshold_breaches": _first_breaches(fc["breaches"]),
         "warnings": fc["warnings"],
         "model_notes": fc["notes"],
     }

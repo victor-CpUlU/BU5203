@@ -233,6 +233,8 @@ class TaskSpec:
     refs: Callable[[dict], list[tuple[str, str]]] | None = None  # (owner_id, evidence_id) pairs cited
     retry_transport: bool = False                              # True only for Section 2 (confirmed rule)
     soft_unknown_refs: bool = False                            # True only for Section 5 (Req 25.6)
+    schema_id: str | None = None                               # output schema when it differs from prompt_id (Section 3 parts)
+    part: str | None = None                                    # recorded in the audit trail (Section 3 parts)
 
 
 def canonical_json(obj) -> str:
@@ -260,7 +262,7 @@ def run_llm_task(task: TaskSpec, input_obj: dict, prompts: dict[str, PromptFile]
     prompt = prompts[task.prompt_id]
     system = prompts["MASTER"].text
     base_user = prompt.text.replace("{{INPUT_JSON}}", canonical_json(input_obj))
-    schema = SCHEMAS[task.prompt_id]
+    schema = SCHEMAS[task.schema_id or task.prompt_id]
     secrets = settings.secrets()
     attempts = settings.llm_max_retries + 1
     errors: list[str] = []
@@ -278,7 +280,8 @@ def run_llm_task(task: TaskSpec, input_obj: dict, prompts: dict[str, PromptFile]
                 continue
             return {"ok": False, "errors": [msg], "transport": True, "attempts": attempt}
         audit({"type": "llm_output", "prompt_id": prompt.prompt_id, "prompt_version": prompt.version,
-               "model": getattr(client, "model_name", "unknown"), "input_hash": input_hash, "attempt": attempt})
+               "model": getattr(client, "model_name", "unknown"), "input_hash": input_hash, "attempt": attempt,
+               **({"part": task.part} if task.part else {})})
         try:
             data = json.loads(strip_fences(raw))
         except json.JSONDecodeError as exc:
