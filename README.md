@@ -17,8 +17,8 @@ This app helps a credit analyst decide whether a borrower can support a specific
 | What you see | Produced by | How |
 |---|---|---|
 | Historical figures and ratios (Revenue, EBITDA, Debt/EBITDA, DSCR, interest coverage, current ratio, ...) | **Financial database** | Read from the borrower's sheet in the workbook. Each ratio is defined by the workbook's own formula over its `Inputs` sheet. If the file has no saved formula results, Python evaluates those formulas exactly as written. It never invents its own definition. Definitions can differ by company (for example, DSCR is a proxy for AMD and NVIDIA); hover a metric name to see its definition. |
-| Quarter-on-quarter changes and up/down/stable labels | **Python** | Difference between consecutive quarters: percentage points for %, x for multiples, days for DSO, % change for amounts. "Stable" bands are in `config/analysis.toml`. |
-| Flags (zero, negative, large swing, n/m, blank) | **Python** | Fixed rules, listed in `Instructions.md` 4.4. Values are never changed. |
+| Quarter-on-quarter changes and up/down/stable labels | **Python** | Difference between consecutive quarters: percentage points for %, x for multiples, days for DSO, % change for amounts. See [stable bands and large swings](#stable-bands-and-large-swings) below. |
+| Flags (zero, negative, large swing, n/m, blank) | **Python** | Fixed rules, listed in `Instructions.md` 4.4 and [below](#stable-bands-and-large-swings). Values are never changed. |
 | Divergence patterns (e.g. revenue up while operating cash flow down) | **Python** | Compares the up/down labels of two metrics in the same quarters. |
 | Forecast, scenarios and pro-forma debt service | **Python**, from **analyst-editable assumptions** | See [the forecast model](#how-the-forecast-is-calculated) below. Base-case defaults are the averages of the database quarters. |
 | Thresholds that highlight forecast quarters | **Analyst** | Optional; there are no defaults and no pass/fail result. |
@@ -37,6 +37,42 @@ This app helps a credit analyst decide whether a borrower can support a specific
 | `FT-...` | A threshold you entered |
 | `EV-...` | A passage in an uploaded PDF |
 | `DI-...` | A field from the deal intake |
+
+### Stable bands and large swings
+
+The stable bands are **not calculated from the data**. They are fixed tolerances set in `config/analysis.toml` (`[stable_band]`), chosen to ignore rounding-level movements. They are labelling rules, not credit benchmarks.
+
+For each pair of consecutive quarters, Python works out the change in the metric's own unit:
+
+| Metric unit | Change measured as | Stable band ("~") | Large swing flag |
+|---|---|---|---|
+| Percent (e.g. EBITDA margin, revenue growth) | later value - earlier value, in percentage points | within ±1.0 pp | more than 10.0 pp |
+| Multiple (e.g. Debt/EBITDA, DSCR) | later value - earlier value, in x | within ±0.10x | more than 2.0x |
+| Days (DSO) | later value - earlier value, in days | within ±3.0 days | more than 5.0 days |
+| Amount (e.g. revenue, cash, USD m) | (later - earlier) / \|earlier\| x 100, in % | within ±5.0% | more than 50% of the earlier value |
+
+How the label is chosen:
+- **Inside the band:** the change is labelled **~ (stable)**.
+- **Above the band:** **up**.
+- **Below the band:** **down**.
+
+Rules:
+- The band is inclusive: a change of exactly +1.0 pp on a percent metric is still "stable".
+- Changes use the database values as displayed (e.g. 18.79% vs -0.71% gives +19.5 pp).
+- Only consecutive quarters are compared. A blank quarter breaks the chain, so no change is computed across it.
+- If an amount's earlier value is 0, the % change is "Not computable". The label then follows the sign of the later value.
+
+**Example (Intel Q1-FY2026 to Q2-FY2026):**
+- **DSCR** 0.62x to 0.90x is +0.28x. That is outside ±0.10x, so it is labelled **up**.
+- **Revenue** 13,577 to 16,128 is +18.8%. That is outside ±5%, so it is labelled **up**.
+
+The **large-swing** thresholds (`[large_swing]`) only add a review flag; they never change a value.
+
+**Sustained trends:** a metric is labelled "sustained improvement" or "sustained deterioration" when its last two changes have the same direction and neither is stable.
+- Lower is better for Debt/EBITDA, DSO, total debt, net debt, Debt/Equity, short-term debt and interest expense.
+- Capital expenditure is neutral: it gets "sustained increase" or "sustained decrease".
+
+To change any band or threshold, edit `config/analysis.toml` and restart the app. New values apply to deals connected (or reconnected) afterwards. A missing or invalid value falls back to the defaults shown above.
 
 ### How the forecast is calculated
 
