@@ -197,6 +197,18 @@ The badge at the top right shows which AI provider is in use. A red **"AI not co
 
 The left-hand menu follows Sections 1 to 6. Under each step it shows that step's status, for example "completed", "not run" or "Out of date". Work through them in order.
 
+**Finding your way on each page:**
+- **Next-step bar:** a coloured bar at the top of every section says what to do now, with the button for it. For example, "18 statements need review" with **Approve all verified**, or "Approve the financial analysis".
+- **How this works:** the longer explanation of each section is behind the **How this works** link under its one-line intro.
+- **Statements:**
+  - Each one shows only the badges that need attention: Pending, Flagged, Number mismatch, Assumption or Not verified. A green "✓ numbers verified" means Python matched every figure.
+  - Click **N sources** to see its Evidence IDs.
+  - **Approve** is the main button; Flag, Edit and Comment are under **More**. A statement with a number mismatch shows **Edit** and **Flag** instead, because approving does not clear a mismatch.
+  - Approved statements fold to a single line; click to open one.
+- **Show only what needs attention:** this button, in the next-step bar of Sections 2, 3 and 6, hides everything already reviewed. Click again to show everything. The choice is remembered.
+- **Section 3 tabs:** Section 3 is split into **Trends**, **Peers**, **Forecast** and **Repayment**. Each tab shows how many statements in it still need review.
+- **Charts:** each line is labelled with its latest value only; hover a point for the others. Supporting metrics (Revenue Growth (Y/Y), EBITDA (LTM), EBITDA excl. impairment) are behind **Show more metrics** on the panel.
+
 ### Section 1: Deal intake and data
 
 1. On the home page, click **Start a new deal**.

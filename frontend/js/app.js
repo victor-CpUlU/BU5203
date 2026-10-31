@@ -4,7 +4,8 @@
 const $main = document.getElementById("main");
 const $nav = document.getElementById("steps");
 const $name = document.getElementById("analyst-name");
-const state = { status: null, deal: null, charts: [], reviewFilter: "All", activeStatement: null };
+const state = { status: null, deal: null, charts: [], reviewFilter: "All", activeStatement: null,
+  attentionOnly: localStorage.getItem("attentionOnly") === "1", s3Tab: "trends", showMore: {} };
 
 const STEPS = [
   ["intake", "1. Deal intake & data"],
@@ -118,6 +119,85 @@ function nextSection(dealId, screen, label = "Next Section") {
     h("a", { class: "button-link next-btn", href: `#/deal/${dealId}/${screen}` }, label, h("span", { class: "next-arrow", "aria-hidden": "true" }, "\u2192")));
 }
 
+// --------------------------------------------------------------------------- decluttering helpers
+// A statement needs the analyst's attention while Pending, or while it has a number mismatch that is not Flagged
+// (approving does not clear a mismatch).
+const needsAttention = (s) => s.status === "Pending" || (s.verification && s.verification.mark === "Number mismatch" && s.status !== "Flagged");
+const isDone = (s) => !needsAttention(s);
+
+// One-sentence intro; the longer explanation sits behind "How this works".
+function lead(text, ...more) {
+  return h("div", { class: "lead" }, h("p", {}, text),
+    more.length ? h("details", { class: "howto" }, h("summary", {}, "How this works"),
+      h("div", { class: "howto-body" }, more.filter(Boolean).map((m) => (typeof m === "string" ? h("p", {}, m) : m)))) : null);
+}
+
+// The single "what to do now" bar at the top of each section. kind: todo | ok | warn | blocked
+function nextStep(kind, text, ...actions) {
+  const icon = { todo: "\u2192", ok: "\u2713", warn: "!", blocked: "\u2715" }[kind] || "\u2192";
+  return h("div", { class: `next-step ${kind}` }, h("span", { class: "ns-icon", "aria-hidden": "true" }, icon),
+    h("div", { class: "ns-text" }, text), h("div", { class: "ns-actions" }, actions.filter(Boolean)));
+}
+
+// Hides everything already reviewed inside containers marked .attn-scope (CSS), without re-rendering.
+function attentionToggle(n) {
+  const label = () => (state.attentionOnly ? `Show everything` : `Show only what needs attention (${n})`);
+  const b = h("button", { type: "button", class: "small secondary", "aria-pressed": String(state.attentionOnly) }, label());
+  b.addEventListener("click", () => {
+    state.attentionOnly = !state.attentionOnly;
+    localStorage.setItem("attentionOnly", state.attentionOnly ? "1" : "0");
+    $main.classList.toggle("attention-only", state.attentionOnly);
+    b.setAttribute("aria-pressed", String(state.attentionOnly));
+    b.textContent = label();
+    announce(state.attentionOnly ? "Showing only items that need attention" : "Showing everything");
+  });
+  return b;
+}
+
+// Only badges that ask for attention; a quiet tick when the numbers check out.
+function stmtBadges(st) {
+  const out = [];
+  if (st.status === "Pending") out.push(tag("Pending", "warn"));
+  if (st.status === "Flagged") out.push(tag("Flagged", "bad"));
+  if (st.verification && st.verification.mark === "Number mismatch") out.push(tag("Number mismatch", "bad"));
+  else if (st.verification) out.push(h("span", { class: "ok-mark", title: "Python matched every figure to its source" }, "\u2713 numbers verified"));
+  if (st.label !== "Sourced") out.push(tag(labelText(st.label), labelKind(st.label)));
+  if (st.source === "backend") out.push(tag("Backend-generated", "muted"));
+  return out;
+}
+
+function stmtRef(st) {
+  return h("span", { class: "stmt-ref", title: st.position_path || "Short ID used in the audit trail" },
+    st.position ? `${st.position} \u00b7 ` : "", st.id);
+}
+
+// Evidence IDs folded into "N sources"; open = show the chips straight away.
+function sourceList(refs, sid, onOpen, open = false) {
+  if (!refs.length) return h("span", { class: "small muted" }, "No references");
+  return h("details", { class: "srcs", open: open || null },
+    h("summary", {}, `${refs.length} source${refs.length > 1 ? "s" : ""}`), h("span", { class: "srcs-list" }, refs.map((r) => evButton(r, sid, onOpen))));
+}
+
+// Primary action stays visible; the rest go in a "More" menu. more: [[label, (button) => ...], ...]
+function actionBar(primary, more, hint) {
+  const menu = more.length ? h("details", { class: "more-menu" }, h("summary", { "aria-label": "More actions" }, "More \u25be"),
+    h("div", { class: "more-list" }, more.map(([label, fn]) => {
+      const b = h("button", { type: "button", class: "small secondary" }, label);
+      b.addEventListener("click", () => fn(b));
+      return b;
+    }))) : null;
+  return h("div", { class: "actions" }, primary, menu, hint ? h("span", { class: "small muted" }, hint) : null);
+}
+
+// Approved, nothing outstanding: shown as one line that expands. Otherwise a normal card.
+function stmtShell(st, idPrefix) {
+  const collapse = st.status === "Approved" && isDone(st);
+  const cls = `stmt ${st.status}${isDone(st) ? " done" : ""}${state.activeStatement === st.id ? " active" : ""}${collapse ? " collapsed" : ""}`;
+  if (!collapse) return { box: h("div", { class: cls, id: `${idPrefix}${st.id}` }, h("div", { class: "stmt-text" }, st.text)), collapse };
+  return { box: h("details", { class: cls, id: `${idPrefix}${st.id}` },
+    h("summary", { class: "stmt-sum" }, h("span", { class: "tick", "aria-label": "Approved" }, "\u2713"), h("span", { class: "clamp" }, st.text))), collapse };
+}
+
 async function download(path, body, button) {
   await busy(button, "Generating PDF...", async () => {
     const res = await fetch(`/api${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
@@ -178,11 +258,13 @@ async function refreshDeal() {
 
 async function route() {
   destroyCharts();
+  $main.classList.toggle("attention-only", state.attentionOnly);
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   try {
     if (parts[0] === "deal" && parts[1]) {
       state.deal = await api("GET", `/deals/${parts[1]}`);
       const screen = parts[2] || "intake";
+      if (screen === "dashboard" && parts[3]) state.s3Tab = parts[3];  // e.g. #/deal/<id>/dashboard/repayment
       renderNav(screen);
       await ({ intake: screenIntake, extraction: screenExtraction, dashboard: screenDashboard, risks: screenRisks,
         memo: screenMemo, review: screenReview }[screen] || screenIntake)();
@@ -356,12 +438,23 @@ async function screenIntake() {
         h("td", {}, d.extraction_excluded ? tag("No extractable text: excluded", "bad") : d.no_text_pages.length ? tag(`${d.no_text_pages.length} page(s) without text`, "warn") : "")))))
     : h("p", { class: "empty" }, "No documents uploaded yet. Upload the 10-K, 10-Q, annual report or audited statements.");
 
+  const fin = deal.financial.status;
+  const step = !deal.documents.length
+    ? nextStep("todo", "Upload the borrower's filings (10-K, 10-Q, annual report) as PDFs below.")
+    : fin === "error"
+      ? nextStep("warn", `Documents uploaded, but the financial database could not be connected: ${deal.financial.error || "unknown error"}`,
+        h("a", { class: "button-link", href: `#/deal/${deal.deal_id}/extraction` }, "Fix in Section 2"))
+      : nextStep("ok", `${deal.documents.length} document${deal.documents.length > 1 ? "s" : ""} uploaded and the financial database is connected. Next: run the extraction.`,
+        h("a", { class: "button-link", href: `#/deal/${deal.deal_id}/extraction` }, "Go to Section 2"));
   $main.replaceChildren(
     h("h2", {}, "Section 1: Deal intake and data"),
-    h("div", { class: "card" }, h("h3", {}, "Loan request"), intakeTable),
-    h("div", { class: "card" }, h("h3", {}, "Documents"), upForm, h("div", { style: "margin-top:12px" }, docTable)),
-    h("p", {}, "Financial data is fetched automatically from the external financial database and shown in ",
-      h("a", { href: `#/deal/${deal.deal_id}/extraction` }, "Section 2"), "."),
+    step,
+    h("details", { class: "card", open: !deal.documents.length || null }, h("summary", {}, h("b", {}, "Loan request"), " ",
+      h("span", { class: "small muted" }, `${deal.intake["DI-FACILITY_TYPE"].display}, ${deal.intake["DI-AMOUNT"].display}, ${deal.intake["DI-TENOR"].display}`)),
+      h("div", { style: "margin-top:10px" }, intakeTable),
+      h("p", { class: "small" }, h("a", { href: `#/edit/${deal.deal_id}` }, "Edit the loan request"))),
+    h("div", { class: "card" }, h("h3", {}, "Documents"), docTable, h("details", { class: "upload", open: !deal.documents.length || null },
+      h("summary", {}, "Upload a document"), h("div", { style: "margin-top:10px" }, upForm))),
     nextSection(deal.deal_id, "extraction"));
 }
 
@@ -393,14 +486,15 @@ async function financialCard(deal) {
       h("p", { class: "empty" }, "The financial database is not connected for this deal."), reconnectButton(deal));
   }
   const ds = await api("GET", `/deals/${deal.deal_id}/financial`);
-  return h("div", { class: "card" },
-    h("h3", {}, "2C Financial data (external database)"),
-    h("p", { class: "disclaimer" }, "These figures are fetched automatically from the external financial database (",
-      h("b", {}, fin.file_name || ds.file_name), ds.sheet ? `, sheet \u201c${ds.sheet}\u201d` : "",
-      "), connected via the system. Values are the database's own figures and ratios, exactly as the workbook defines them; nothing is calculated or extracted by the AI."),
-    ds.company ? h("p", {}, `Company: ${ds.company}. Amounts in ${ds.currency_unit || "units not stated"}. Companies in the database: ${(ds.companies_in_database || []).join(", ")}.`) : null,
+  // Connected: a one-line summary that opens to the detail (the figures are reviewed in Section 3).
+  return h("details", { class: "card" },
+    h("summary", {}, h("b", {}, "2C Financial data"), " ", h("span", { class: "ok-mark" }, "\u2713 connected"), " ",
+      h("span", { class: "small muted" }, `${ds.company || ""}${ds.sheet ? ` (sheet ${ds.sheet})` : ""}, ${ds.metrics.length} metrics, ${ds.periods.length} quarters, ${ds.flagged_values.length} values flagged`)),
+    h("p", { style: "margin-top:10px" }, "Fetched automatically from ", h("b", {}, fin.file_name || ds.file_name),
+      ". Values are the database's own figures and ratios, exactly as the workbook defines them; nothing is calculated or extracted by the AI."),
+    ds.company ? h("p", { class: "small" }, `Amounts in ${ds.currency_unit || "units not stated"}. Companies in the database: ${(ds.companies_in_database || []).join(", ")}.`) : null,
     ds.calculation_note ? h("p", { class: "small muted" }, ds.calculation_note) : null,
-    h("p", {}, `Periods (oldest to newest): ${ds.periods.map((p) => p.label + (p.calendar_quarter ? ` (${p.calendar_quarter})` : "")).join(", ")}. Metrics: ${ds.metrics.length}.`),
+    h("p", { class: "small" }, `Periods (oldest to newest): ${ds.periods.map((p) => p.label + (p.calendar_quarter ? ` (${p.calendar_quarter})` : "")).join(", ")}.`),
     h("div", { class: "row" }, reconnectButton(deal)),
     h("h4", {}, `Values flagged for review (${ds.flagged_values.length})`),
     ds.flagged_values.length ? h("table", {}, h("thead", {}, h("tr", {}, ["Evidence ID", "Metric", "Period", "Value", "Flags"].map((x) => h("th", {}, x)))),
@@ -493,7 +587,8 @@ async function screenExtraction() {
   const s2EvRow = (f, e, id, showLabel) => {
     const located = e.location_status === "Located";
     const actions = h("td", { class: "s2-actions" });
-    const tr = h("tr", {},
+    const st = e.status || "Pending";
+    const tr = h("tr", { class: st === "Pending" || !located ? "" : "done" },
       h("td", {}, showLabel ? f.label : ""),
       h("td", {}, evButton(id, null, sourceDialog)),
       h("td", { class: "stmt-cell" }, h("div", {}, e.statement),
@@ -501,12 +596,10 @@ async function screenExtraction() {
         e.status === "Flagged" && e.note ? h("div", { class: "flag-note" }, "Flag note: ", e.note) : null),
       h("td", {}, e.doc_name),
       h("td", {}, String(e.page)),
-      h("td", {}, tag(located ? "Located" : "Review", located ? "ok" : "bad"),
+      h("td", {}, located ? h("span", { class: "ok-mark", title: "The extracted text was found on the cited page" }, "\u2713 found") : tag("Not found: check", "bad"),
         e.issues && e.issues.length ? h("div", { class: "small muted", style: "margin-top:2px" }, e.issues.join("; ")) : null),
-      h("td", {}, tag(e.status || "Pending", statusKind(e.status || "Pending"))),
+      h("td", {}, st === "Approved" ? h("span", { class: "ok-mark" }, "\u2713 Approved") : tag(st, statusKind(st))),
       actions);
-    const ap = h("button", { type: "button", class: "small" }, "Approve");
-    ap.addEventListener("click", (ev) => s2Action(id, "approve", null, ev.currentTarget));
     const editor = (kind) => {
       actions.querySelector(".editor")?.remove();
       const ta = h("textarea", { "aria-label": kind === "edit" ? `Edit ${id}` : `Flag note for ${id}`, maxlength: kind === "edit" ? 2000 : 500 }, kind === "edit" ? e.statement : "");
@@ -515,11 +608,14 @@ async function screenExtraction() {
       const ed = h("div", { class: "editor" }, ta, h("div", { class: "row" }, save, h("button", { type: "button", class: "small secondary", onclick: () => ed.remove() }, "Cancel")));
       actions.append(ed); ta.focus();
     };
-    const fl = h("button", { type: "button", class: "small secondary" }, "Flag");
-    fl.addEventListener("click", () => editor("flag"));
-    const ed = h("button", { type: "button", class: "small secondary" }, "Edit");
-    ed.addEventListener("click", () => editor("edit"));
-    actions.append(h("div", { class: "row" }, ap, fl, ed));
+    const primary = [];
+    if (st !== "Approved") {
+      const ap = h("button", { type: "button", class: "small" }, "Approve");
+      ap.addEventListener("click", (ev) => s2Action(id, "approve", null, ev.currentTarget));
+      primary.push(ap);
+    }
+    const more = [...(st !== "Flagged" ? [["Flag", () => editor("flag")]] : []), ["Edit", () => editor("edit")]];
+    actions.append(actionBar(primary, more));
     return tr;
   };
   const group = (scope, title, key) => {
@@ -541,8 +637,7 @@ async function screenExtraction() {
         h("ul", {}, f.rejected.map((r) => h("li", {}, `${r.statement} (${r.doc_id} p.${r.page}): ${r.reason}`)))))));
     }
     const cols = ["13%", "9%", "30%", "12%", "5%", "9%", "8%", "14%"].map((w) => h("col", { style: `width:${w}` }));
-    return h("div", { class: "card" }, head,
-      h("p", { class: "small muted" }, "Approve each item you accept, or Edit its generated statement (editing re-checks the passage and resets it to Pending). Items you approve here are shown as \u201cApproved in Section 2\u201d in the memo review."),
+    return h("div", { class: "card attn-scope" }, head,
       s2.message ? h("p", { class: "tag warn" }, s2.message) : null,
       h("div", { class: "table-wrap" },
         h("table", { class: "s2-table" }, h("colgroup", {}, cols),
@@ -561,13 +656,27 @@ async function screenExtraction() {
       await rerender();
     } catch (e) { /* shown */ }
   });
+  const notFound = docEv.filter((e) => e.location_status !== "Located").length;
+  const extracted = sec.s2a.status !== "not_run" || sec.s2b.status !== "not_run";
+  const stale = [sec.s2a, sec.s2b].some((x) => x.status === "stale");
+  const attnN = docEv.filter((e) => (e.status || "Pending") === "Pending" || e.location_status !== "Located").length;
+  let step;
+  if (!deal.documents.length) step = nextStep("blocked", "Upload at least one PDF in Section 1 first.", h("a", { class: "button-link", href: `#/deal/${deal.deal_id}/intake` }, "Go to Section 1"));
+  else if (!extracted) step = nextStep("todo", "Run the extraction. The AI reads the relevant pages; this takes a few minutes.", run(["business", "debt"], "Run extraction (2A and 2B)"));
+  else if (pendingEv) step = nextStep("todo", [h("b", {}, `${pendingEv} item${pendingEv > 1 ? "s" : ""} to review`),
+    notFound ? `, ${notFound} whose text was not found on the page (check those first).` : ". Compare each statement with its source, then approve."],
+    bulkBtn, attentionToggle(attnN));
+  else step = nextStep("ok", "Every extracted item is reviewed. Next: the financial dashboard.", h("a", { class: "button-link", href: `#/deal/${deal.deal_id}/dashboard` }, "Go to Section 3"));
   $main.replaceChildren(
     h("h2", {}, "Section 2: Extract and organise the relevant information"),
     h("div", { class: "card" },
-      h("p", {}, "The AI reads the uploaded documents and extracts business information (2A) and debt and financing information (2B). Each item gets an Evidence ID and its extracted text is located on the cited page with PyMuPDF. Financial figures (2C) are not extracted by the AI; they are fetched automatically from the external financial database."),
-      deal.documents.length ? h("div", { class: "row" }, run(["business", "debt"], "Run extraction (2A and 2B)"), run(["business"], "Re-run 2A only"), run(["debt"], "Re-run 2B only"),
-        docEv.length ? h("span", { class: "spacer" }) : null, docEv.length ? bulkBtn : null)
-        : h("p", { class: "tag warn" }, "Upload at least one PDF in Section 1 first.")),
+      lead("The AI extracts business (2A) and debt (2B) facts from the PDFs; Python checks each quoted passage is really on the cited page.",
+        "Each item gets an Evidence ID. Click it to see the page with the passage highlighted. Approve each item you accept, or Edit its statement (editing re-checks the passage and resets it to Pending). Items you approve here show as \u201cApproved in Section 2\u201d in the memo review.",
+        "Financial figures (2C) are not extracted by the AI; they are fetched automatically from the financial database."),
+      step,
+      extracted && deal.documents.length ? h("div", { class: "row small", style: "margin-top:8px" }, h("span", { class: "spacer" }),
+        ...[run(["business", "debt"], stale ? "Re-run extraction (out of date)" : "Re-run extraction"), run(["business"], "Re-run 2A only"), run(["debt"], "Re-run 2B only")]
+          .map((b) => { b.className = "small secondary"; return b; })) : null),
     group("business", "2A Business information", "s2a"),
     group("debt", "2B Debt and financing information", "s2b"),
     finCard,
@@ -582,20 +691,27 @@ const pointLabels = {
     chart.data.datasets.forEach((ds, i) => {
       const meta = chart.getDatasetMeta(i);
       if (meta.hidden) return;
+      // Label only the latest value; every other value is in the tooltip and the data table.
+      let last = -1;
+      ds.data.forEach((v, j) => { if (v !== null && v !== undefined) last = j; });
       meta.data.forEach((pt, j) => {
-        if (ds.data[j] === null || ds.data[j] === undefined) return;
+        if (j !== last) return;
         const text = ds.displays[j] + (ds.flags[j].length ? " \u26a0" : "");
         ctx.save(); ctx.font = "600 11px 'Segoe UI', sans-serif"; ctx.fillStyle = "#0f2d4e"; ctx.textAlign = "center";
-        ctx.fillText(text, pt.x, pt.y - 9); ctx.restore();
+        ctx.textAlign = "left"; ctx.fillStyle = ds.borderColor || "#0f2d4e";
+        ctx.fillText(text, Math.min(pt.x + 7, chart.chartArea.right - ctx.measureText(text).width), pt.y - 8); ctx.restore();
       });
     });
   },
 };
 
+// Supporting rows (Revenue Growth Y/Y, EBITDA LTM, EBITDA excl. impairment) are hidden until "Show more metrics".
+const visibleMetrics = (panel) => panel.metrics.filter((m) => !m.memo || state.showMore[panel.key]);
+
 function panelCharts(panel, periods) {
   const wrap = h("div", {});
   const byUnit = {};
-  panel.metrics.forEach((m) => { const k = m.unit === "amount" ? `amount|${m.unit_label || ""}` : m.unit; (byUnit[k] = byUnit[k] || []).push(m); });
+  visibleMetrics(panel).forEach((m) => { const k = m.unit === "amount" ? `amount|${m.unit_label || ""}` : m.unit; (byUnit[k] = byUnit[k] || []).push(m); });
   let colour = 0;
   for (const [unitKey, metrics] of Object.entries(byUnit)) {
     const unit = unitKey.split("|")[0];
@@ -606,13 +722,14 @@ function panelCharts(panel, periods) {
       const c = PALETTE[colour++ % PALETTE.length];
       return { label: m.label, data: m.series.map((p) => p.value), displays: m.series.map((p) => p.display), flags: m.series.map((p) => p.flags),
         borderColor: c, backgroundColor: c, pointBackgroundColor: c, pointBorderColor: "#ffffff", pointBorderWidth: 1.5,
-        borderWidth: 2.5, spanGaps: false, tension: .25, pointRadius: 4.5, pointHoverRadius: 6,
+        borderWidth: 2.5, spanGaps: false, tension: .25, pointRadius: 3.5, pointHoverRadius: 6,
         pointStyle: m.series.map((p) => (p.flags.length ? "triangle" : "circle")), pointRadiusFlags: 6 };
     });
     const AXIS = "#5a6676", GRID = "rgba(15,45,78,.08)", NAVY = "#0f2d4e";
     state.charts.push(new Chart(canvas, {
       type: "line", data: { labels: periods, datasets },
-      options: { responsive: true, maintainAspectRatio: false, animation: false, layout: { padding: { top: 18 } },
+      options: { responsive: true, maintainAspectRatio: false, animation: false, layout: { padding: { top: 18, right: 54 } },
+        interaction: { mode: "index", intersect: false },
         plugins: {
           legend: { position: "bottom", labels: { color: NAVY, usePointStyle: true, pointStyle: "circle", padding: 14, font: { size: 12 } } },
           tooltip: { backgroundColor: NAVY, titleColor: "#fff", bodyColor: "#fff", borderColor: "#c79214", borderWidth: 1, padding: 10, cornerRadius: 6, displayColors: true,
@@ -638,23 +755,23 @@ function dataTable(panel, periods) {
       }))))));
 }
 
-function s3Statement(st, approved) {
-  const box = h("div", { class: `stmt ${st.status}`, id: `st-${st.id}` });
-  const meta = h("div", { class: "meta" }, st.position ? h("span", { class: "pos" }, st.position) : null,
-    h("code", { title: "Short ID used in the audit trail" }, st.id), tag(labelText(st.label), labelKind(st.label)),
-    tag(st.verification.mark, st.verification.mark === "Numbers verified" ? "ok" : "bad"), tag(st.status, statusKind(st.status)),
-    st.refs.map((r) => evButton(r, null, sourceDialog)));
-  box.append(h("div", {}, st.text), meta);
-  if (st.text !== st.original_text) box.append(h("div", { class: "small muted" }, "Edited. AI original: ", st.original_text));
-  if (st.verification.unmatched.length) box.append(h("div", { class: "unmatched" }, "Not matched: " + st.verification.unmatched.map((u) => `${u.value} (${u.reason})`).join("; ")));
-  if (st.comments.length) box.append(h("ul", { class: "small" }, st.comments.map((c) => h("li", {}, `${c.analyst_name}: ${c.text}`))));
+function s3Statement(st) {
+  const { box, collapse } = stmtShell(st, "st-");
+  const bodyEl = collapse ? h("div", { class: "stmt-body" }, h("div", { class: "stmt-text" }, st.text)) : box;
+  if (collapse) box.append(bodyEl);
+  const mismatch = st.verification.mark === "Number mismatch";
+  bodyEl.append(h("div", { class: "meta" }, stmtBadges(st), sourceList(st.refs, null, sourceDialog, mismatch), stmtRef(st)));
+  if (st.text !== st.original_text) bodyEl.append(h("div", { class: "small muted" }, "Edited. AI original: ", st.original_text));
+  if (st.verification.unmatched.length) bodyEl.append(h("div", { class: "unmatched" }, "Not matched: " + st.verification.unmatched.map((u) => `${u.value} (${u.reason})`).join("; ")));
+  if (st.comments.length) bodyEl.append(h("ul", { class: "small" }, st.comments.map((c) => h("li", {}, `${c.analyst_name}: ${c.text}`))));
   const act = async (action, text, btn) => {
     if (needName()) return;
     try {
       await busy(btn, "Saving...", () => api("POST", `/deals/${state.deal.deal_id}/section3/statements/${st.id}/action`, { action, analyst_name: analyst(), text }));
       announce(`${st.id} ${action} saved`);
       await rerender();
-      document.getElementById(`st-${st.id}`)?.querySelector("button")?.focus();
+      const el = document.getElementById(`st-${st.id}`);
+      (el?.querySelector(".actions button") || el?.querySelector("summary"))?.focus();
     } catch (e) { /* shown */ }
   };
   const editor = (kind) => {
@@ -662,15 +779,23 @@ function s3Statement(st, approved) {
     const save = h("button", { type: "button", class: "small" }, kind === "edit" ? "Save edit" : "Save comment");
     save.addEventListener("click", () => act(kind, ta.value, save));
     const ed = h("div", { class: "editor" }, ta, h("div", { class: "row" }, save, h("button", { type: "button", class: "small secondary", onclick: () => ed.remove() }, "Cancel")));
-    box.querySelector(".editor")?.remove();
-    box.append(ed); ta.focus();
+    bodyEl.querySelector(".editor")?.remove();
+    bodyEl.append(ed); ta.focus();
   };
-  const actions = h("div", { class: "actions" });
-  const ap = h("button", { type: "button", class: "small" }, "Approve"); ap.addEventListener("click", () => act("approve", null, ap));
-  const fl = h("button", { type: "button", class: "small secondary" }, "Flag"); fl.addEventListener("click", () => act("flag", null, fl));
-  actions.append(ap, fl, h("button", { type: "button", class: "small secondary", onclick: () => editor("comment") }, "Comment"),
-    h("button", { type: "button", class: "small secondary", onclick: () => editor("edit") }, "Edit"));
-  box.append(actions);
+  // A mismatch is cleared by Edit or Flag, not Approve, so those become the visible actions.
+  const primary = [];
+  const more = [];
+  const mk = (label, cls, fn) => { const b = h("button", { type: "button", class: `small ${cls}` }, label); b.addEventListener("click", () => fn(b)); return b; };
+  if (mismatch && st.status !== "Flagged") {
+    primary.push(mk("Edit", "", () => editor("edit")), mk("Flag", "secondary", (b) => act("flag", null, b)));
+    more.push(["Comment", () => editor("comment")]);
+  } else {
+    if (st.status !== "Approved") primary.push(mk("Approve", "", (b) => act("approve", null, b)));
+    if (st.status !== "Flagged") more.push(["Flag", (b) => act("flag", null, b)]);
+    if (st.status === "Flagged") more.push(["Approve", (b) => act("approve", null, b)]);
+    more.push(["Edit", () => editor("edit")], ["Comment", () => editor("comment")]);
+  }
+  bodyEl.append(actionBar(primary, more, mismatch && st.status !== "Flagged" ? "Fix the figure with Edit, or Flag it" : null));
   return box;
 }
 
@@ -793,11 +918,12 @@ async function peerCard(deal) {
   };
 
   body.append(
-    h("p", {}, "Compare the borrower with the other companies in the financial database. Tick any metric for any company; the charts update immediately. Values come straight from the database (", h("b", {}, data.file_name), "); the AI does not see or calculate this comparison."),
-    h("ul", { class: "small muted" },
+    lead("Tick any metric for any company to compare the borrower with its peers.",
+      `Values come straight from the database (${data.file_name}); the AI does not see or calculate this comparison.`,
+      h("ul", { class: "small muted" },
       h("li", {}, "Quarters are lined up by the calendar date range each fiscal quarter falls in, as stated in the workbook (e.g. NVIDIA Q2-FY2027 and Intel Q2-FY2026 are both CQ2 2026, Apr\u2013Jun). Hover a point to see its fiscal quarter and report date."),
       h("li", {}, "Amounts are in each company's own unit, shown in the legend: USD m, or NT$ bn for TSMC. Ratios and percentages are directly comparable."),
-      h("li", {}, "Some ratios are defined differently by company (for example DSCR). Open \u201cHow each company defines it\u201d under a chart.")),
+      h("li", {}, "Some ratios are defined differently by company (for example DSCR). Open \u201cHow each company defines it\u201d under a chart."))),
     presets,
     h("div", { class: "table-wrap", style: "margin-top:10px" }, matrix),
     h("h4", {}, "Charts"), chartsBox);
@@ -1025,7 +1151,9 @@ async function forecastCard(deal, aiStatements) {
   };
 
   body.append(
-    h("p", {}, "Calculated by the backend in Python from the database figures and the assumptions below; the AI calculates nothing. Every forecast value has an FC- Evidence ID that the AI commentary and memo cite. Figures are projections from stated assumptions, not reported results."),
+    lead("Projections from the assumptions below, calculated by Python. Change any value and the results update.",
+      "The AI calculates nothing. Every forecast value has an FC- Evidence ID that the AI commentary and the memo cite. Figures are projections from stated assumptions, not reported results.",
+      "Save the assumptions before running the AI analysis: saving changed values marks Sections 3 to 5 out of date so they are re-run with the new forecast."),
     statusLine,
     h("h4", {}, "Scenario assumptions"), h("div", { class: "table-wrap" }, aTable),
     h("h4", {}, "Requested facility and horizon"), facGrid,
@@ -1034,7 +1162,7 @@ async function forecastCard(deal, aiStatements) {
     h("div", { class: "row", style: "margin-top:12px" }, saveBtn, resetBtn, h("span", { class: "small muted" }, "Changes preview immediately; save to use them in the AI analysis and memo.")),
     h("h4", {}, "Results"), results,
     h("h4", { class: "commentary-head", style: "margin-top:18px" }, "AI commentary on the forecast"),
-    aiStatements.length ? h("div", {}, aiStatements.map((s) => s3Statement(s))) : h("p", { class: "muted small" }, "No AI forecast commentary yet. Save the assumptions, then run the AI financial analysis."));
+    aiStatements.length ? h("div", { class: "attn-scope" }, aiStatements.map((s) => s3Statement(s))) : h("p", { class: "muted small" }, "No AI forecast commentary yet. Save the assumptions, then run the AI financial analysis."));
   setStatus();
   renderResults();
   return card;
@@ -1078,28 +1206,44 @@ async function screenDashboard() {
     });
     return b;
   };
-  const bulkRow = has && counts.Pending ? h("div", { class: "row", style: "margin-top:8px" },
-    h("span", { class: "small" }, h("b", {}, "Bulk review: ")),
-    bulk("approve_verified", "Approve all pending with \u201cNumbers verified\u201d", pendingVerified,
-      `Approve ${pendingVerified} pending statement(s) whose figures Python matched to the database?\n\nThis confirms you have read them and agree with the interpretation, not just the numbers. Each approval is recorded under your name.`),
-    bulk("flag_mismatches", "Flag all pending with \u201cNumber mismatch\u201d", pendingMismatch,
-      `Flag ${pendingMismatch} pending statement(s) whose figures did not match the database?`)) : null;
   const s3state = deal.sections.s3;
-  const top = h("div", { class: "card" },
-    h("p", {}, `Charts use the financial database values directly${dash.company ? ` (${dash.company}, ${dash.file_name})` : ""}. Below them, the forecast and scenario analysis is calculated by the backend from assumptions you can edit; set and save them before running the AI analysis, because the AI commentary and the memo use them. The AI commentary is checked by Python: every figure must match the cited data and every comparison must match the backend's comparison records.`),
-    dash.calculation_note ? h("p", { class: "small muted" }, dash.calculation_note) : null,
-    h("div", { class: "row" }, runBtn,
-      has ? h("span", {}, tag(`${counts.Pending} pending`, "warn"), " ", tag(`${counts.Approved} approved`, "ok"), " ", tag(`${counts.Flagged} flagged`, "bad"), " ",
-        tag(`${mismatches} number mismatch(es)`, mismatches ? "bad" : "ok")) : null,
-      h("span", { class: "spacer" }),
-      has ? (deal.s3_approved ? tag(`Approved by ${s3.approval?.analyst_name || "analyst"}`, "ok") : approveBtn) : null),
-    s3state.status === "stale" ? h("p", { class: "tag warn" }, "Out of date: an earlier section was re-run. Re-run the AI analysis.") : null,
-    s3state.last_error ? h("details", {}, h("summary", {}, "Last run failed"), h("ul", {}, s3state.last_error.map((x) => h("li", {}, x)))) : null,
-    has && !deal.s3_approved ? h("p", { class: "small muted" }, "To approve, every statement must be Approved or Flagged, and any statement with a number mismatch must be corrected or flagged. Read the commentary beside each chart first; use the bulk buttons for the remaining routine statements.") : null,
-    bulkRow);
+  const attention = stmts.filter(needsAttention);
+  const nMismatchOpen = attention.filter((s) => s.verification.mark === "Number mismatch").length;
+  const reRun = h("button", { type: "button", class: "secondary small" }, "Re-run AI analysis");
+  reRun.addEventListener("click", async () => {
+    try { await busy(reRun, "The AI is analysing trends; the backend is checking every figure...", () => api("POST", `/deals/${deal.deal_id}/section3/run`)); toast("Section 3 analysis ready for review.", true); await rerender(); } catch (e) { }
+  });
 
+  // ---- one "what to do now" bar ----
+  let step;
+  if (!has) step = nextStep("todo", "Check the charts and the forecast assumptions (Forecast tab), then run the AI analysis. It takes about a minute.", runBtn);
+  else if (s3state.status === "stale") step = nextStep("warn", `${s3state.message || "Out of date: an earlier section changed."} Re-run the AI analysis so the commentary matches.`, runBtn);
+  else if (deal.s3_approved) step = nextStep("ok", `Financial analysis approved by ${s3.approval?.analyst_name || "the analyst"}. Continue to Section 4.`,
+    h("a", { class: "button-link", href: `#/deal/${deal.deal_id}/risks` }, "Go to Section 4"));
+  else if (attention.length) step = nextStep("todo",
+    [h("b", {}, `${attention.length} statement${attention.length > 1 ? "s" : ""} need${attention.length > 1 ? "" : "s"} review`),
+      ` (${counts.Pending} pending${nMismatchOpen ? `, ${nMismatchOpen} with a number mismatch to Edit or Flag` : ""}). Then approve the financial analysis.`],
+    pendingVerified ? bulk("approve_verified", "Approve all verified", pendingVerified,
+      `Approve ${pendingVerified} pending statement(s) whose figures Python matched to the database?\n\nThis confirms you have read them and agree with the interpretation, not just the numbers. Each approval is recorded under your name.`) : null,
+    pendingMismatch ? bulk("flag_mismatches", "Flag all mismatches", pendingMismatch, `Flag ${pendingMismatch} pending statement(s) whose figures did not match the database?`) : null,
+    attentionToggle(attention.length));
+  else step = nextStep("todo", "Every statement is reviewed. Approve the financial analysis to unlock Section 4.", approveBtn);
+
+  const top = h("div", { class: "card" },
+    lead(`Charts show ${dash.company || "the borrower"}'s figures from the financial database; the AI commentary beside them is checked figure by figure by Python.`,
+      `Values come from ${dash.file_name}. ${dash.calculation_note || ""}`,
+      "The forecast is calculated by the backend from assumptions you can edit (Forecast tab). Save them before running the AI analysis, because the AI commentary and the memo use them.",
+      "To approve the analysis, every statement must be Approved or Flagged, and a statement with a number mismatch must be corrected with Edit or Flagged (approving it does not clear the mismatch)."),
+    step,
+    has ? h("div", { class: "row small muted", style: "margin-top:8px" },
+      `${counts.Approved} approved \u00b7 ${counts.Flagged} flagged \u00b7 ${counts.Pending} pending`, h("span", { class: "spacer" }), reRun) : null,
+    s3state.last_error ? h("details", {}, h("summary", {}, "Last run failed"), h("ul", {}, s3state.last_error.map((x) => h("li", {}, x)))) : null);
+
+  // ---- Trends tab: one card per panel ----
   const panels = dash.panels.map((p) => {
-    const latest = p.metrics.length ? h("div", { class: "latest" }, p.metrics.map((m) => {
+    const shown = visibleMetrics(p);
+    const hiddenN = p.metrics.length - shown.length;
+    const latest = shown.length ? h("div", { class: "latest" }, shown.map((m) => {
       const c = m.latest_comparison;
       // Colour the delta by whether the move is favourable, not just its direction (from the backend:
       // "lower" = lower is better, e.g. Debt/EBITDA, DSO; "neutral" = neither, e.g. capex).
@@ -1116,37 +1260,82 @@ async function screenDashboard() {
           : h("div", { class: "metric-delta flat" }, "no comparison"),
         m.sustained ? h("div", { class: "metric-sustained" }, m.sustained) : null);
     })) : null;
-    const commentary = stmts.filter((s) => s.group === `panel:${p.key}`).map((s) => s3Statement(s));
+    const group = stmts.filter((s) => s.group === `panel:${p.key}`);
+    const open = group.filter(needsAttention).length;
+    const moreBtn = p.metrics.some((m) => m.memo) ? h("button", { type: "button", class: "small ghost",
+      onclick: async () => { state.showMore[p.key] = !state.showMore[p.key]; await rerender(); } },
+      state.showMore[p.key] ? "Show fewer metrics" : `Show ${hiddenN} more metric${hiddenN > 1 ? "s" : ""}`) : null;
     return h("section", { class: "card panel-card", "aria-labelledby": `panel-${p.key}` },
-      h("div", { class: "panel-head" }, h("h3", { id: `panel-${p.key}` }, p.title)),
+      h("div", { class: "panel-head row" }, h("h3", { id: `panel-${p.key}` }, p.title), h("span", { class: "spacer" }),
+        has ? (open ? tag(`${open} to review`, "warn") : tag("\u2713 reviewed", "ok")) : null, moreBtn),
       h("div", { class: "panel" },
         h("div", { class: "panel-data" }, panelCharts(p, dash.periods), latest,
           p.not_available.length ? h("p", { class: "not-avail" }, h("b", {}, "Not available in database: "), p.not_available.join(", ")) : null, dataTable(p, dash.periods)),
-        h("div", { class: "panel-commentary" }, h("h4", { class: "commentary-head" }, "AI commentary"),
-          commentary.length ? commentary : h("p", { class: "muted small" }, "No AI commentary yet. Run the AI financial analysis above."))));
+        h("div", { class: "panel-commentary attn-scope" }, h("h4", { class: "commentary-head" }, "AI commentary"),
+          group.length ? group.map((s) => s3Statement(s)) : h("p", { class: "muted small" }, "No AI commentary yet."),
+          group.length && !open ? h("p", { class: "all-done-note" }, "\u2713 Everything in this panel is reviewed.") : null)));
   });
+  const divergence = has ? h("details", { class: "card" }, h("summary", {}, h("b", {}, "Divergence patterns (Project Details)"), " ",
+    h("span", { class: "small muted" }, `${s3.divergences.filter((d) => (d.observed || []).length).length} observed of ${s3.divergences.length}`)),
+    h("table", { style: "margin-top:10px" }, h("thead", {}, h("tr", {}, h("th", {}, "Pattern"), h("th", {}, "Result"), h("th", {}, "Missing metrics"))),
+      h("tbody", {}, s3.divergences.map((d) => h("tr", {}, h("td", {}, `${d.pattern_id}: ${d.description}`), h("td", {}, d.result), h("td", {}, d.missing_metrics.join(", ") || "-")))))) : null;
+
+  // ---- Repayment tab ----
+  const cross = stmts.filter((s) => s.group === "cross");
+  const dims = ["profitability", "cash_generation", "leverage", "liquidity", "debt_servicing"];
+  const repayCards = has ? [
+    h("div", { class: "card attn-scope" }, h("h3", {}, "Relationships between metrics"), cross.length ? cross.map((s) => s3Statement(s)) : h("p", { class: "muted" }, "None reported."),
+      cross.length && !cross.some(needsAttention) ? h("p", { class: "all-done-note" }, "\u2713 All reviewed.") : null),
+    h("div", { class: "card attn-scope" }, h("h3", {}, "Repayment capacity"),
+      dims.map((d) => {
+        const sup = stmts.filter((s) => s.group === `repayment:${d}:supports`), weak = stmts.filter((s) => s.group === `repayment:${d}:weakens`);
+        return h("div", { class: `repay-dim${[...sup, ...weak].some(needsAttention) ? "" : " done-group"}` },
+          h("h4", {}, d.replace("_", " ").replace(/^./, (c) => c.toUpperCase())),
+          h("div", { class: "repay-cols" },
+            h("div", { class: "repay-col supports" }, h("p", { class: "repay-head" }, "\u2713 Supports repayment"), sup.map((s) => s3Statement(s))),
+            h("div", { class: "repay-col weakens" }, h("p", { class: "repay-head" }, "\u26a0 Weakens repayment"), weak.map((s) => s3Statement(s)))));
+      }))] : [h("p", { class: "empty" }, "Run the AI analysis to see the repayment-capacity assessment.")];
+
+  // ---- tabs ----
   const peerBox = await peerCard(deal);
   const fcCard = await forecastCard(deal, stmts.filter((s) => s.group === "forecast"));
+  const openIn = (pred) => stmts.filter((s) => pred(s.group) && needsAttention(s)).length;
+  const TABS = [
+    ["trends", "Trends", [...panels, divergence], openIn((g) => g.startsWith("panel:"))],
+    ["peers", "Peers", [peerBox], 0],
+    ["forecast", "Forecast", [fcCard], openIn((g) => g === "forecast")],
+    ["repayment", "Repayment", repayCards, openIn((g) => g === "cross" || g.startsWith("repayment:"))],
+  ];
+  if (!TABS.some(([k]) => k === state.s3Tab)) state.s3Tab = "trends";
+  const tabBtns = {}, tabPanels = {};
+  const select = (key, focus) => {
+    state.s3Tab = key;
+    for (const [k] of TABS) {
+      tabBtns[k].setAttribute("aria-selected", String(k === key)); tabBtns[k].tabIndex = k === key ? 0 : -1;
+      tabPanels[k].hidden = k !== key;
+    }
+    if (focus) tabBtns[key].focus();
+    const want = `#/deal/${deal.deal_id}/dashboard/${key}`;
+    if (location.hash !== want) history.replaceState(null, "", want);  // keeps the tab on refresh, no reload
+    window.dispatchEvent(new Event("resize"));  // charts drawn while hidden pick up their size
+  };
+  const tablist = h("div", { class: "tabs", role: "tablist", "aria-label": "Section 3 views" });
+  TABS.forEach(([k, label, , n], i) => {
+    const b = h("button", { type: "button", role: "tab", id: `tab-${k}`, "aria-controls": `tabpanel-${k}`, class: "tab" },
+      label, n ? h("span", { class: "tab-count", "aria-label": `${n} to review` }, String(n)) : null);
+    b.addEventListener("click", () => select(k));
+    b.addEventListener("keydown", (ev) => {
+      if (ev.key !== "ArrowRight" && ev.key !== "ArrowLeft") return;
+      const next = TABS[(i + (ev.key === "ArrowRight" ? 1 : TABS.length - 1)) % TABS.length][0];
+      select(next, true);
+    });
+    tabBtns[k] = b; tablist.append(b);
+  });
+  const panelsEls = TABS.map(([k, , content]) => (tabPanels[k] = h("div", { role: "tabpanel", id: `tabpanel-${k}`, "aria-labelledby": `tab-${k}`, class: "tabpanel" }, content.filter(Boolean))));
 
-  const extra = [];
-  if (has) {
-    extra.push(h("div", { class: "card" }, h("h3", {}, "Divergence patterns (Project Details)"),
-      h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Pattern"), h("th", {}, "Result"), h("th", {}, "Missing metrics"))),
-        h("tbody", {}, s3.divergences.map((d) => h("tr", {}, h("td", {}, `${d.pattern_id}: ${d.description}`), h("td", {}, d.result), h("td", {}, d.missing_metrics.join(", ") || "-")))))));
-    const cross = stmts.filter((s) => s.group === "cross");
-    extra.push(h("div", { class: "card" }, h("h3", {}, "Relationships between database metrics"), cross.length ? cross.map((s) => s3Statement(s)) : h("p", { class: "muted" }, "None reported.")));
-    const dims = ["profitability", "cash_generation", "leverage", "liquidity", "debt_servicing"];
-    extra.push(h("div", { class: "card" }, h("h3", {}, "Repayment capacity"),
-      dims.map((d) => h("div", { class: "repay-dim" },
-        h("h4", {}, d.replace("_", " ").replace(/^./, (c) => c.toUpperCase())),
-        h("div", { class: "repay-cols" },
-          h("div", { class: "repay-col supports" }, h("p", { class: "repay-head" }, "\u2713 Supports repayment"), stmts.filter((s) => s.group === `repayment:${d}:supports`).map((s) => s3Statement(s))),
-          h("div", { class: "repay-col weakens" }, h("p", { class: "repay-head" }, "\u26a0 Weakens repayment"), stmts.filter((s) => s.group === `repayment:${d}:weakens`).map((s) => s3Statement(s))))))));
-  }
-  const emptyState = has ? null : h("div", { class: "empty" },
-    "No AI analysis yet. Review the charts and the forecast assumptions below, then click \u201cRun AI financial analysis\u201d above to add the AI commentary.");
-  $main.replaceChildren(...[h("h2", {}, "Section 3: Financial trend dashboard and AI analysis"), top, emptyState, ...panels, peerBox, fcCard, ...extra,
+  $main.replaceChildren(...[h("h2", {}, "Section 3: Financial dashboard and AI analysis"), top, tablist, ...panelsEls,
     nextSection(deal.deal_id, "risks")].filter(Boolean));
+  select(state.s3Tab);
 }
 
 // --------------------------------------------------------------------------- Section 4
@@ -1158,19 +1347,27 @@ async function screenRisks() {
     try { await busy(runBtn, "The AI is identifying material risks...", () => api("POST", `/deals/${deal.deal_id}/section4/run`)); await rerender(); } catch (e) { }
   });
   const st = deal.sections.s4;
+  let step;
+  if (!deal.s3_approved) step = nextStep("blocked", "Approve the financial analysis in Section 3 first.", h("a", { class: "button-link", href: `#/deal/${deal.deal_id}/dashboard` }, "Go to Section 3"));
+  else if (!s4.risks) step = nextStep("todo", "Identify the key risks. The AI uses the approved Section 3 analysis, the extracted facts and the loan request.", runBtn);
+  else if (st.status === "stale") step = nextStep("warn", "Out of date: an earlier section changed. Re-run the risk analysis.", runBtn);
+  else step = nextStep("ok", `${s4.risks.length} risk${s4.risks.length === 1 ? "" : "s"} identified. Read them, then generate the memo.`,
+    h("a", { class: "button-link", href: `#/deal/${deal.deal_id}/memo` }, "Go to Section 5"));
+  if (s4.risks && st.status !== "stale") { runBtn.className = "small secondary"; }
   const head = h("div", { class: "card" },
-    h("p", {}, "Uses the approved Section 3 analysis, the extracted business and debt information and the loan request."),
-    h("div", { class: "row" }, runBtn, deal.s3_approved ? null : tag("Section 3 approval is required first", "warn")),
-    st.status === "stale" ? h("p", { class: "tag warn" }, "Out of date: an earlier section changed. Re-run the risk analysis.") : null,
+    lead("Ranked credit risks with evidence, mitigants and proposed terms. These are suggestions for you to consider, not lending decisions.",
+      "Each risk's evidence is number-checked by Python. Any covenant with a numeric threshold is labelled Assumption with \u201cIllustrative; analyst to calibrate against credit policy.\u201d"),
+    step,
+    s4.risks && st.status !== "stale" ? h("div", { class: "row", style: "margin-top:8px" }, h("span", { class: "spacer" }), runBtn) : null,
     st.last_error ? h("details", {}, h("summary", {}, "Last run failed"), h("ul", {}, st.last_error.map((x) => h("li", {}, x)))) : null);
   const body = [];
-  body.push(h("p", { class: "disclaimer" }, "Suggestions for the analyst's consideration only, not automatic lending decisions."));
   if (s4.risks) {
     body.push(h("table", {}, h("thead", {}, h("tr", {}, ["Identified Risk", "Evidence", "Possible Mitigant", "Proposed Term / Monitoring Condition"].map((x) => h("th", { scope: "col" }, x)))),
       h("tbody", {}, s4.risks.length ? s4.risks.map((r) => h("tr", {},
         h("td", {}, h("b", {}, `${r.rank}. ${r.identified_risk}`), h("div", { class: "small" }, r.category), h("div", {}, tag(`Impact: ${r.impact}`, r.impact === "High" ? "bad" : "warn"), " ", tag(`Likelihood: ${r.likelihood}`, "info")), h("code", { class: "small" }, r.risk_id)),
-        h("td", {}, h("div", {}, r.evidence.text), h("div", { class: "meta" }, r.evidence.refs.map((x) => evButton(x, null, sourceDialog))),
-          tag(r.verification.mark, r.verification.mark === "Numbers verified" ? "ok" : "bad"),
+        h("td", {}, h("div", {}, r.evidence.text), h("div", { class: "meta" },
+            r.verification.mark === "Numbers verified" ? h("span", { class: "ok-mark" }, "\u2713 numbers verified") : tag(r.verification.mark, "bad"),
+            sourceList(r.evidence.refs, null, sourceDialog)),
           r.verification.unmatched.length ? h("div", { class: "unmatched" }, "Not matched: " + r.verification.unmatched.map((u) => u.value).join(", ")) : null,
           h("div", { class: "small muted" }, "Time horizon: ", r.time_horizon),
           r.business_context ? h("div", { class: "small" }, "Context: ", r.business_context.text, " ", r.business_context.refs.map((x) => evButton(x, null, sourceDialog))) : null),
@@ -1178,27 +1375,26 @@ async function screenRisks() {
         h("td", {}, h("ul", {}, r.terms.map((t) => h("li", {}, tag(t.term_type, "info"), " ", t.text, " ", tag(labelText(t.label), labelKind(t.label)))))))) :
         h("tr", {}, h("td", { colspan: 4 }, "No risks supported by the evidence provided.")))));
     if (s4.limitations.length) body.push(h("h4", {}, "Limitations"), h("ul", {}, s4.limitations.map((l) => h("li", {}, l))));
-  } else body.push(h("p", { class: "empty" }, "Not run yet."));
-  $main.replaceChildren(h("h2", {}, "Section 4: Identify key risks and suggest mitigants"), head, h("div", { class: "card" }, body),
-    nextSection(deal.deal_id, "memo"));
+  }
+  $main.replaceChildren(...[h("h2", {}, "Section 4: Identify key risks and suggest mitigants"), head, body.length ? h("div", { class: "card" }, body) : null,
+    nextSection(deal.deal_id, "memo")].filter(Boolean));
 }
 
 // --------------------------------------------------------------------------- Sections 5 and 6
 function memoStatement(st, review, openSource) {
-  const box = h("div", { class: `stmt ${st.status}${state.activeStatement === st.id ? " active" : ""}`, id: `m-${st.id}` });
-  box.append(h("div", {}, st.text),
-    h("div", { class: "meta" }, st.position ? h("span", { class: "pos", title: st.position_path || null }, st.position) : null,
-      h("code", { title: "Short ID used in the audit trail" }, st.id), tag(labelText(st.label), labelKind(st.label)), tag(st.status, statusKind(st.status)),
-      tag(st.verification.mark, st.verification.mark === "Numbers verified" ? "ok" : "bad"),
-      st.source === "backend" ? tag("Backend-generated", "muted") : null,
-      st.refs.length ? st.refs.map((r) => evButton(r, st.id, openSource)) : h("span", { class: "muted" }, "No references")));
+  // Read-only memo view (Section 5): plain text with its sources folded away.
+  const { box, collapse } = review ? stmtShell(st, "m-") : { box: h("div", { class: `stmt plain ${st.status}`, id: `m-${st.id}` }, h("div", { class: "stmt-text" }, st.text)), collapse: false };
+  const bodyEl = collapse ? h("div", { class: "stmt-body" }, h("div", { class: "stmt-text" }, st.text)) : box;
+  if (collapse) box.append(bodyEl);
+  const mismatch = st.verification.mark === "Number mismatch";
+  bodyEl.append(h("div", { class: "meta" }, stmtBadges(st), sourceList(st.refs, st.id, openSource, review && st.id === state.activeStatement), stmtRef(st)));
   // The carried-over badge (shown below in review mode) already states the note, so don't repeat it here.
   const carriedOver = st.carried_over && st.status === "Approved";
-  if (st.note && !carriedOver) box.append(h("div", { class: "note-line" }, "Note: ", st.note));
-  if (st.verification.unmatched.length) box.append(h("div", { class: "unmatched" }, "Not matched: " + st.verification.unmatched.map((u) => `${u.value} (${u.reason})`).join("; ")));
-  if (st.text !== st.original_text) box.append(h("div", { class: "small muted" }, "Edited. AI original: ", st.original_text));
+  if (st.note && !carriedOver) bodyEl.append(h("div", { class: "note-line" }, "Note: ", st.note));
+  if (st.verification.unmatched.length) bodyEl.append(h("div", { class: "unmatched" }, "Not matched: " + st.verification.unmatched.map((u) => `${u.value} (${u.reason})`).join("; ")));
+  if (st.text !== st.original_text) bodyEl.append(h("div", { class: "small muted" }, "Edited. AI original: ", st.original_text));
   if (review && state.status.support_check_enabled) {
-    box.append(h("div", { class: "note-line" }, st.support ? [tag(st.support.assessment, st.support.assessment === "Supported" ? "ok" : st.support.assessment === "Not supported" ? "bad" : "warn"),
+    bodyEl.append(h("div", { class: "note-line" }, st.support ? [tag(st.support.assessment, st.support.assessment === "Supported" ? "ok" : st.support.assessment === "Not supported" ? "bad" : "warn"),
       " ", st.support.reason, " ", h("span", { class: "muted" }, "(AI preliminary check; analyst verification required)")] : h("span", { class: "muted" }, "AI support check: Not checked")));
   }
   if (!review) return box;
@@ -1217,7 +1413,8 @@ function memoStatement(st, review, openSource) {
       badge = "\u2713 Backend-generated";
       detail = "Generated by the backend from the financial database (not AI-written) \u2014 no action needed here. Click an Evidence ID to inspect the source.";
     }
-    box.append(h("div", { class: "carried-over" }, tag(badge, "ok"), h("span", { class: "small muted" }, detail)));
+    bodyEl.append(h("div", { class: "carried-over" }, tag(badge, "ok"), h("span", { class: "small muted" }, detail)));
+    if (collapse) box.querySelector(".stmt-sum").append(h("span", { class: "carried-tag" }, badge.replace("\u2713 ", "")));
     return box;
   }
   const act = async (action, text, btn) => {
@@ -1227,7 +1424,8 @@ function memoStatement(st, review, openSource) {
       state.activeStatement = st.id;
       announce(`${st.id}: ${action} saved`);
       await rerender();
-      document.querySelector(`#m-${st.id} button`)?.focus();
+      const el = document.getElementById(`m-${st.id}`);
+      (el?.querySelector(".actions button") || el?.querySelector("summary"))?.focus();
     } catch (e) { }
   };
   const editor = (kind) => {
@@ -1235,12 +1433,21 @@ function memoStatement(st, review, openSource) {
     const save = h("button", { type: "button", class: "small" }, kind === "correct" ? "Save edit" : "Flag with note");
     save.addEventListener("click", () => act(kind === "correct" ? "correct" : "flag", ta.value, save));
     const ed = h("div", { class: "editor" }, ta, h("div", { class: "row" }, save, h("button", { type: "button", class: "small secondary", onclick: () => ed.remove() }, "Cancel")));
-    box.querySelector(".editor")?.remove(); box.append(ed); ta.focus();
+    bodyEl.querySelector(".editor")?.remove(); bodyEl.append(ed); ta.focus();
   };
-  const ap = h("button", { type: "button", class: "small" }, "Approve"); ap.addEventListener("click", () => act("approve", null, ap));
-  box.append(h("div", { class: "actions" }, ap,
-    h("button", { type: "button", class: "small secondary", onclick: () => editor("flag") }, "Flag"),
-    h("button", { type: "button", class: "small secondary", onclick: () => editor("correct") }, "Edit")));
+  const mk = (label, cls, fn) => { const b = h("button", { type: "button", class: `small ${cls}` }, label); b.addEventListener("click", () => fn(b)); return b; };
+  const primary = [], more = [];
+  if (mismatch && st.status !== "Flagged") {
+    primary.push(mk("Edit", "", () => editor("correct")), mk("Flag", "secondary", () => editor("flag")));
+    // Unlike Section 3, a memo approval is not blocked by a mismatch (e.g. a false alarm the analyst has checked).
+    more.push(["Approve as is", (b) => act("approve", null, b)]);
+  } else {
+    if (st.status !== "Approved") primary.push(mk("Approve", "", (b) => act("approve", null, b)));
+    if (st.status === "Flagged") more.push(["Approve", (b) => act("approve", null, b)]);
+    else more.push(["Flag", () => editor("flag")]);
+    more.push(["Edit", () => editor("correct")]);
+  }
+  bodyEl.append(actionBar(primary, more, mismatch && st.status !== "Flagged" ? "Fix the figure with Edit, or Flag it" : null));
   return box;
 }
 
@@ -1254,10 +1461,13 @@ function memoBody(s5, review, openSource, filter = "All") {
     const subs = [];
     let current = null;
     for (const s of sts) {
-      if (s.subsection !== current) { subs.push(h("h4", {}, s.subsection_title)); current = s.subsection; }
+      if (s.subsection !== current) {
+        const allDone = sts.filter((x) => x.subsection === s.subsection).every(isDone);
+        subs.push(h("h4", { class: allDone ? "done-group" : null }, s.subsection_title)); current = s.subsection;
+      }
       subs.push(memoStatement(s, review, openSource));
     }
-    sections.push(h("section", { class: "memo-section" }, h("h3", {}, `${num}. ${bySection[num][0].section_title}`), subs));
+    sections.push(h("section", { class: `memo-section${sts.every(isDone) ? " done-group" : ""}` }, h("h3", {}, `${num}. ${bySection[num][0].section_title}`), subs));
   }
   return sections.length ? sections : [h("p", { class: "empty" }, "No statements match this filter.")];
 }
@@ -1271,14 +1481,25 @@ async function screenMemo() {
     try { await busy(runBtn, "The AI is writing the memo; the backend is checking every reference and figure...", () => api("POST", `/deals/${deal.deal_id}/section5/run`)); await rerender(); } catch (e) { }
   });
   const st = deal.sections.s5;
+  const pendingN = s5.statements ? s5.statements.filter((s) => s.status === "Pending").length : 0;
+  let step;
+  if (deal.sections.s4.status !== "completed") step = nextStep("blocked", "Complete Section 4 (key risks) first, and make sure it is up to date.",
+    h("a", { class: "button-link", href: `#/deal/${deal.deal_id}/risks` }, "Go to Section 4"));
+  else if (!s5.statements) step = nextStep("todo", "Generate the credit memo. The AI writes it from Sections 1 to 4; this can take 2 to 3 minutes.", runBtn);
+  else if (st.status === "stale") step = nextStep("warn", "Out of date: an earlier section changed. Regenerate the memo.", runBtn);
+  else step = nextStep(pendingN ? "todo" : "ok", pendingN ? `${pendingN} statement${pendingN > 1 ? "s" : ""} to review in Section 6, then export the memo.` : "Every statement is reviewed. Export the memo in Section 6.",
+    h("a", { class: "button-link", href: `#/deal/${deal.deal_id}/review` }, pendingN ? "Review in Section 6" : "Export in Section 6"));
+  if (s5.statements && st.status !== "stale") runBtn.className = "small secondary";
   const topCard = h("div", { class: "card" },
-    h("p", {}, "The memo uses only Sections 1-4 and cites existing Evidence IDs. Information gaps and flagged database values are added by the backend. There is no AI recommendation; the analyst decides."),
-    h("div", { class: "row" }, runBtn, deal.sections.s4.status === "completed" ? null : tag("Section 4 must be completed first", "warn")),
-    st.status === "stale" ? h("p", { class: "tag warn" }, "Out of date: an earlier section changed. Regenerate the memo.") : null,
+    lead("A 7-section credit memo drafted by the AI from Sections 1 to 4, with every figure and citation checked by Python. There is no AI recommendation; you decide.",
+      "The memo cites only existing Evidence IDs. Information gaps, flagged database values and the forecast scenario summaries are added by the backend.",
+      "Regenerating replaces the memo and resets all Section 6 reviews."),
+    step,
+    s5.statements && st.status !== "stale" ? h("div", { class: "row", style: "margin-top:8px" }, h("span", { class: "spacer" }), runBtn) : null,
     st.last_error ? h("details", {}, h("summary", {}, "Last run failed"), h("ul", {}, st.last_error.map((x) => h("li", {}, x)))) : null);
 
   if (!s5.statements) {
-    $main.replaceChildren(h("h2", {}, "Section 5: Credit memo"), topCard, h("p", { class: "empty" }, "No memo yet. Generate the credit memo to see the overview."));
+    $main.replaceChildren(h("h2", {}, "Section 5: Credit memo"), topCard);
     return;
   }
 
@@ -1310,8 +1531,8 @@ async function screenMemo() {
       kvText("Tenor", i["DI-TENOR"].display)),
     h("p", { class: "small muted", style: "margin-top:8px" }, "Purpose: ", i["DI-PURPOSE"].display));
 
-  const pipeline = h("div", { class: "card" },
-    h("h3", {}, "What has been analysed"),
+  const pipeline = h("details", { class: "card" },
+    h("summary", {}, h("b", {}, "What has been analysed")),
     h("ul", { class: "small" },
       h("li", {}, `${deal.documents.length} document(s) uploaded; financial database ${deal.financial.status === "connected" || deal.financial.status === "loaded" ? "connected" : "not connected"}.`),
       h("li", {}, !evCount.total
@@ -1334,11 +1555,7 @@ async function screenMemo() {
       kv("Carried over", carried)),
     h("p", { class: "small muted", style: "margin-top:8px" },
       `Labels: ${labels.Sourced} Sourced, ${labels.ASSUMPTION} Assumption, ${labels["NOT VERIFIED"]} Not verified.`),
-    h("p", { class: needsReview ? "disclaimer" : "ready-line" },
-      needsReview ? `${counts.Pending} statement(s) still need review in Section 6 before the memo can be exported.`
-                  : "All statements reviewed. The memo is ready to export in Section 6."),
-    h("div", { class: "row" },
-      h("a", { href: `#/deal/${deal.deal_id}/review`, class: "button-link" }, needsReview ? "Go to Section 6 to review" : "Go to Section 6 to export")));
+    needsReview ? null : h("p", { class: "ready-line" }, "All statements reviewed."));
 
   const fullMemo = h("details", { class: "card" },
     h("summary", {}, "View full memo (all 7 sections)"),
@@ -1387,17 +1604,26 @@ async function screenReview() {
       await rerender();
     } catch (e) { /* shown */ }
   });
-  const tools = h("div", { class: "row" }, memoBtn, auditBtn, bulkBtn,
-    counts.Pending ? tag(`${counts.Pending} statement(s) still Pending: the final memo needs every statement Approved or Flagged`, "warn") : tag("Review complete", "ok"));
+  const attn = s5.statements.filter(needsAttention).length;
+  const step = counts.Pending
+    ? nextStep("todo", [h("b", {}, `${counts.Pending} statement${counts.Pending > 1 ? "s" : ""} to review.`),
+      " Open a statement's sources, compare them with the text, then Approve, Flag or Edit. The final memo needs every statement Approved or Flagged."],
+      bulkBtn, attentionToggle(attn))
+    : nextStep("ok", "Review complete. Download the final memo and the audit trail.", memoBtn, auditBtn);
+  const tools = h("div", { class: "row" }, filters, h("span", { class: "spacer" }), counts.Pending ? memoBtn : null, counts.Pending ? auditBtn : null);
+  if (counts.Pending) { memoBtn.className = "small secondary"; auditBtn.className = "small secondary"; memoBtn.disabled = true; memoBtn.title = "Available when no statement is Pending"; }
   if (state.status.support_check_enabled) {
-    const sc = h("button", { type: "button", class: "secondary" }, "Run AI support check");
+    const sc = h("button", { type: "button", class: "small secondary" }, "Run AI support check");
     sc.addEventListener("click", async () => { try { await busy(sc, "Running the advisory support check...", () => api("POST", `/deals/${deal.deal_id}/support-check/run`)); await rerender(); } catch (e) { } });
     tools.append(sc);
   }
   $main.replaceChildren(h("h2", {}, "Section 6: Analyst review and source verification"),
-    h("p", { class: "disclaimer" }, "A citation to an existing page does not confirm accuracy. Compare the statement with the source before approving."),
-    h("div", { class: "card" }, tools, h("div", { style: "margin-top:10px" }, filters)),
-    h("div", { class: "review" }, h("div", { class: "card" }, memoBody(s5, true, openSource, state.reviewFilter)), sourcePanel));
+    h("div", { class: "card" },
+      lead("Check each memo statement against its source before approving: a citation to a real page does not by itself mean the statement is right.",
+        "Click \u201cN sources\u201d on a statement, then an Evidence ID, to show the source on the right: the page with the passage highlighted, the database cell, or the forecast value. If a passage cannot be found on its page, the statement is flagged automatically.",
+        "Statements already approved in Section 2 or 3, and statements the backend generated from the database, start as Approved and are folded to one line."),
+      step, h("div", { style: "margin-top:10px" }, tools)),
+    h("div", { class: "review" }, h("div", { class: "card attn-scope" }, memoBody(s5, true, openSource, state.reviewFilter)), sourcePanel));
 }
 
 // --------------------------------------------------------------------------- app lifetime
